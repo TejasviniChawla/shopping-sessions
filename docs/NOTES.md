@@ -110,3 +110,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~03:30 ET: FOUND: wall - in-container gap depends on OUTPUT BYTES on the bind mount (docker flushes dirty pages
   at exit): uncompressed parquet (23 MB) costs +0.15 s vs Snappy (9 MB). tmpfs output: no gap. => keep output small (Snappy,
   INT32 where allowed). Do NOT submit c6d9bbd/cd1ddca/50b5fa0 (uncompressed writer). 574a577 recommended.
+- 2026-11-22 ~04:30 ET: SCORER 574a577 = 1.62 s. 6925b5e (Snappy writer) A/B: -5% in-container, -3% wall, exit gap gone; 10 seeds OK.
+  342c221 (dictionary user_id + INT32 counts) neutral vs 6925b5e; 10 seeds OK; recommended submission.
+  CI gains translate to the scorer at ~40%: large fixed cost (container start + output flush) on the scorer.
