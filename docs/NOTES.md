@@ -58,3 +58,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   Added fork-and-exit wrapper (Linux only; NO_FORK=1 disables). Parallel user_daily parts: output phase now ~0.07 s on 10M.
 - 2026-11-20 23:30: reference.py MATCHES dev-answer (seed 1). Binary MATCHES reference on seed 7 (1M). Multi-seed check running.
 - 2026-11-20 23:40: binary MATCHES reference on seeds 2,3,11,23,42,99,123,2028 (200k events each; windows 2025-2028 incl. 2028-01-23 span).
+- 2026-11-21 00:10: Linux VM (Docker Desktop arm64, 4 GB) with bind-mounted data: dev MATCH with fork wrapper (exit 0), but
+  timings dominated by virtiofs reads (782 MB in 4-10 s). Re-testing with data copied into a docker volume.
+  SWAR 13-digit F3 parse added (tests pass, fixtures 36/36, dev MATCH).
