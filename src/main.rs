@@ -324,9 +324,16 @@ where
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 /// Lock-free open-addressing table: PKey -> dense uid. Keys are never 0 (packed keys >= 1, fallbacks have the top bit).
+/// Key and value share one 16-byte slot so a lookup touches one cache line.
+#[repr(C, align(16))]
+struct USlot {
+    key: AtomicU64,
+    val: AtomicU32,
+    _pad: u32,
+}
+
 struct UTable {
-    keys: Vec<AtomicU64>,
-    vals: Vec<AtomicU32>,
+    slots: Vec<USlot>,
     by_uid: Vec<AtomicU64>,
     mask: usize,
     counter: AtomicU32,
@@ -335,31 +342,30 @@ struct UTable {
 impl UTable {
     fn new(est_ids: usize) -> Self {
         let cap = (est_ids * 2).max(1024).next_power_of_two();
-        let mut keys = Vec::with_capacity(cap);
-        let mut vals = Vec::with_capacity(cap);
+        let mut slots = Vec::with_capacity(cap);
         let mut by_uid = Vec::with_capacity(cap);
         for _ in 0..cap {
-            keys.push(AtomicU64::new(0));
-            vals.push(AtomicU32::new(u32::MAX));
+            slots.push(USlot { key: AtomicU64::new(0), val: AtomicU32::new(u32::MAX), _pad: 0 });
             by_uid.push(AtomicU64::new(0));
         }
-        UTable { keys, vals, by_uid, mask: cap - 1, counter: AtomicU32::new(0) }
+        UTable { slots, by_uid, mask: cap - 1, counter: AtomicU32::new(0) }
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
-        prefetch(unsafe { self.keys.as_ptr().add((h as usize) & self.mask) });
+        prefetch(unsafe { self.slots.as_ptr().add((h as usize) & self.mask) });
     }
     #[inline]
     fn get_or_insert(&self, k: PKey, h: u64, sides: &Sides) -> u32 {
         let mut s = (h as usize) & self.mask;
         loop {
-            let cur = self.keys[s].load(Ordering::Acquire);
+            let slot = &self.slots[s];
+            let cur = slot.key.load(Ordering::Acquire);
             let found = if cur == 0 {
-                match self.keys[s].compare_exchange(0, k.0, Ordering::AcqRel, Ordering::Acquire) {
+                match slot.key.compare_exchange(0, k.0, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => {
                         let id = self.counter.fetch_add(1, Ordering::Relaxed);
                         self.by_uid[id as usize].store(k.0, Ordering::Relaxed);
-                        self.vals[s].store(id, Ordering::Release);
+                        slot.val.store(id, Ordering::Release);
                         return id;
                     }
                     Err(other) => PKey(other).same(&k, sides),
@@ -369,7 +375,7 @@ impl UTable {
             };
             if found {
                 loop {
-                    let v = self.vals[s].load(Ordering::Acquire);
+                    let v = slot.val.load(Ordering::Acquire);
                     if v != u32::MAX {
                         return v;
                     }
@@ -419,7 +425,8 @@ impl ThreadOut {
 fn bump(h: &mut Vec<u32>, p: u32) {
     let p = p as usize;
     if p >= h.len() {
-        h.resize(p + 4096, 0);
+        let n = (p + 1).max(h.len() * 2);
+        h.resize(n, 0);
     }
     h[p] += 1;
 }
@@ -1119,7 +1126,8 @@ fn run() {
 
     // Phase 3: dedup + validate + intern + person histogram, per partition, outputs owned by threads
     let pm = PersonMap { person_of_link: &person_of_link, n_link_ids: n_link_ids as u32, n_link_persons };
-    let hist_len = n_link_persons as usize + (table.mask + 1) / 2 + 4096;
+    // singleton persons are numbered densely after the link persons; the histogram grows on demand
+    let hist_len = n_link_persons as usize + 65536;
     let next = AtomicUsize::new(0);
     let outs: Vec<ThreadOut> = std::thread::scope(|s| {
         let mut hs = Vec::new();
