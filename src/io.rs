@@ -6,6 +6,11 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 pub const UNIT: usize = 2 << 20;
+
+/// Work-unit size in bytes; UNIT_KB overrides for experiments (a unit that fits L2 keeps the parse reading from L2).
+pub fn unit_size() -> usize {
+    std::env::var("UNIT_KB").ok().and_then(|v| v.parse::<usize>().ok()).map(|kb| kb << 10).unwrap_or(UNIT)
+}
 /// Bytes read past the unit end to complete the last line (grown if a line is longer).
 pub const TAIL: usize = 64 << 10;
 /// Zero padding after the data so SIMD may over-read.
@@ -51,9 +56,10 @@ fn add_folder(dir: &Path, files: &mut Vec<File>, sizes: &mut Vec<u64>, units: &m
             continue;
         }
         let idx = files.len() as u32;
+        let unit = unit_size() as u64;
         let mut start = 0u64;
         while start < len {
-            let end = (start + UNIT as u64).min(len);
+            let end = (start + unit).min(len);
             units.push(Unit { file: idx, start, end });
             start = end;
         }
@@ -105,7 +111,7 @@ impl Drop for Buffer {
 impl Buffer {
     pub fn new() -> Self {
         let use_mmap = std::env::var_os("USE_MMAP").is_some();
-        Buffer { buf: vec![0u8; UNIT + TAIL + PAD + 1], lo: 0, hi: 0, map: std::ptr::null_mut(), map_base: std::ptr::null_mut(), map_len: 0, use_mmap }
+        Buffer { buf: vec![0u8; unit_size() + TAIL + PAD + 1], lo: 0, hi: 0, map: std::ptr::null_mut(), map_base: std::ptr::null_mut(), map_len: 0, use_mmap }
     }
 
     #[inline(always)]

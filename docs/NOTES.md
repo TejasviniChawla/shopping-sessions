@@ -102,3 +102,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 23:30 ET: SCORER: a805d87 = 1.69 s (new best; A/B predicted ~9%, got 6%). perf on CI: user 3.57 s / sys 1.21 s,
   161k page faults => kernel time ~25% of CPU. Fix in A/B: reuse dedup scratch across partitions, MADV_POPULATE_WRITE after
   MADV_HUGEPAGE for >=2MB HugeVecs.
+- 2026-11-22 ~01:15 ET: pool build 2cf679a A/B +5% vs a805d87 (recommended; 10 seeds MATCH). f747a2d (pooled intern slots,
+  u64 event_type compare) +2% vs 2cf679a on Sapphire Rapids. Next: UNIT_KB experiment (L2-resident parse buffers).
