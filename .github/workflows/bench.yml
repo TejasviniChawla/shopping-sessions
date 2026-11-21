@@ -9,6 +9,9 @@ on:
       seed:
         description: generator seed
         default: "7"
+      compare:
+        description: optional second commit to build and time on the same runner
+        default: ""
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -18,6 +21,12 @@ jobs:
         run: lscpu | head -20; nproc; free -g; cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Build image
         run: docker build -t shopsess:ci .
+      - name: Build comparison image
+        if: ${{ github.event.inputs.compare != '' }}
+        run: |
+          git fetch --depth=1 origin ${{ github.event.inputs.compare }}
+          rm -rf /tmp/cmp && git worktree add /tmp/cmp ${{ github.event.inputs.compare }}
+          docker build -t shopsess:cmp /tmp/cmp
       - name: Build generator
         run: cd tools/generator && cargo build --release
       - name: Generate data
@@ -35,6 +44,16 @@ jobs:
               --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 4 --memory 12g --memory-swap 12g \
               --user 1000:1000 -v /tmp/data:/data:ro -v /tmp/out:/output -v /tmp/scratch:/scratch \
               -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=4 -e MEM_GB=12 shopsess:ci
+          done
+      - name: Comparison image, 3 runs (same runner)
+        if: ${{ github.event.inputs.compare != '' }}
+        run: |
+          for i in 1 2 3; do
+            sudo rm -rf /tmp/out/*
+            /usr/bin/time -f "wall %e s" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m \
+              --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 4 --memory 12g --memory-swap 12g \
+              --user 1000:1000 -v /tmp/data:/data:ro -v /tmp/out:/output -v /tmp/scratch:/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=4 -e MEM_GB=12 shopsess:cmp 2>&1 | sed 's/^/CMP /'
           done
       - name: Run with NCPU=8 (oversubscribed) and with NO_FORK
         run: |

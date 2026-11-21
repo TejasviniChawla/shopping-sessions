@@ -530,16 +530,18 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, table: &U
     for t in 0..raws.len() {
         off[t + 1] = off[t] + raws[t][p].len();
     }
+    // two prefetch streams here (sketch + table): keep the distance short so the miss queue is not overrun
+    const D2: usize = 6;
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
         let n = recs.len();
-        for i in 0..n.min(D) {
+        for i in 0..n.min(D2) {
             sk.prefetch(recs[i].id.hash(sides));
             table.prefetch(recs[i].user.hash(sides));
         }
         for (i, r) in recs.iter().enumerate() {
-            if i + D < n {
-                let nx = &recs[i + D];
+            if i + D2 < n {
+                let nx = &recs[i + D2];
                 sk.prefetch(nx.id.hash(sides));
                 table.prefetch(nx.user.hash(sides));
             }
@@ -633,16 +635,17 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize, table: &U
     let mut slots: Vec<PKey> = vec![PKey(0); cap];
     let mut used: Vec<bool> = vec![false; cap];
     let mut out: HugeVec<ClMid> = HugeVec::with_capacity(total + 16);
+    const D2: usize = 6;
     for tv in raws.iter() {
         let recs = &tv[p][..];
         let n = recs.len();
-        for i in 0..n.min(D) {
+        for i in 0..n.min(D2) {
             sk.prefetch(recs[i].id.hash(sides));
             table.prefetch(recs[i].user.hash(sides));
         }
         for (i, r) in recs.iter().enumerate() {
-            if i + D < n {
-                let nx = &recs[i + D];
+            if i + D2 < n {
+                let nx = &recs[i + D2];
                 sk.prefetch(nx.id.hash(sides));
                 table.prefetch(nx.user.hash(sides));
             }
