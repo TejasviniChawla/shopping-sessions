@@ -34,3 +34,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   venv at ../.venv with polars for the checker scripts. Scaffolded crate.
 - 2026-11-20 20:20: first full Rust pipeline passes 36/36 fixtures and MATCHES dev-answer exactly.
   Local (M-series, 8 threads) 1M events: ~0.25-0.30 s wall. Bug fixed: partition-local uid needed base[q] offset.
+- 2026-11-20 20:45: amd64 image built. target-cpu=cascadelake binary HANGS (99% CPU, no output) under Rosetta in Docker Desktop:
+  Rosetta lacks AVX-512. Default now x86-64-v3 (build arg TARGET_CPU). v2 image passes fixture A1 in container.
+  Local timing on 10M (928 MB) is unreliable while Docker Desktop holds 4 GB of the Mac's 8 GB (heavy swapping, sys time 5-10 s).
+  Observed: dedup phase does random access into mmapped files (id/user byte compare per record) -> plan: inline 16-byte keys.
