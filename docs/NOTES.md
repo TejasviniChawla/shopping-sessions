@@ -38,3 +38,9 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   Rosetta lacks AVX-512. Default now x86-64-v3 (build arg TARGET_CPU). v2 image passes fixture A1 in container.
   Local timing on 10M (928 MB) is unreliable while Docker Desktop holds 4 GB of the Mac's 8 GB (heavy swapping, sys time 5-10 s).
   Observed: dedup phase does random access into mmapped files (id/user byte compare per record) -> plan: inline 16-byte keys.
+- 2026-11-20 21:15 profile (10M events, 782 MB event CSV, single thread, warm cache):
+  lines-only memchr 0.19 s | +split_fields 0.95 s | +parse_event_line 1.14 s | +push to 16 partitions 1.41 s.
+  Cold cache first touch of mmap: 9.1 s (85 MB/s) on this Mac -> scorer must have warm cache / fast disk for a 1 s leader.
+  Whole run single-thread 9.2 s: dedup 0.9, intern 0.37, group 0.27, walk 0.25, output 0.12.
+  Plan: pread into per-thread padded buffers (no mmap faults, safe SIMD over-read), SIMD u128 comma/quote masks per line,
+  SWAR F1 timestamp parse, shrink records.

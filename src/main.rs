@@ -686,6 +686,58 @@ impl<'a> Walker<'a> {
     }
 }
 
+
+/// Micro-benchmark of the parse stages on the event files, single-threaded. Enabled with BENCH=1.
+fn bench(ctx: &Ctx, units: &[(usize, usize, usize)]) {
+    let t = Instant::now();
+    let mut lines = 0usize;
+    let mut bytes = 0usize;
+    for &(fi, start, end) in units {
+        let buf = &ctx.files[fi][..];
+        for l in Lines::new(buf, start, end) {
+            lines += 1;
+            bytes += l.len();
+        }
+    }
+    eprintln!("bench lines only: {} lines, {} MB, {:.3}s", lines, bytes >> 20, t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    let mut ok = 0usize;
+    for &(fi, start, end) in units {
+        let buf = &ctx.files[fi][..];
+        for l in Lines::new(buf, start, end) {
+            let mut f = [&b""[..]; 7];
+            if split_fields(l, &mut f) {
+                ok += f[0].len();
+            }
+        }
+    }
+    eprintln!("bench split_fields: {} {:.3}s", ok, t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for &(fi, start, end) in units {
+        let buf = &ctx.files[fi][..];
+        let base = buf.as_ptr();
+        for l in Lines::new(buf, start, end) {
+            if let Some(r) = parse_event_line(ctx, fi, base, l) {
+                acc = acc.wrapping_add(r.hash ^ r.ts as u64);
+            }
+        }
+    }
+    eprintln!("bench parse_event_line: {} {:.3}s", acc, t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    let mut out: Vec<Vec<EvRaw>> = (0..P).map(|_| Vec::with_capacity(lines / P + 16)).collect();
+    for &(fi, start, end) in units {
+        let buf = &ctx.files[fi][..];
+        let base = buf.as_ptr();
+        for l in Lines::new(buf, start, end) {
+            if let Some(r) = parse_event_line(ctx, fi, base, l) {
+                out[part(r.hash)].push(r);
+            }
+        }
+    }
+    eprintln!("bench parse+push: {} {:.3}s", out.iter().map(|v| v.len()).sum::<usize>(), t.elapsed().as_secs_f64());
+}
+
 // ---------- main ----------
 
 fn main() {
@@ -756,6 +808,10 @@ fn main() {
         nthreads,
     };
     log(&t0, &format!("setup: {} files, {} threads, {} event units", ctx.files.len(), nthreads, inputs.events.len()));
+    if std::env::var("BENCH").is_ok() {
+        bench(&ctx, &inputs.events);
+        return;
+    }
 
     // Phase 1: parse
     let ev_raw = parse_parallel(&ctx, &inputs.events, |c, fi, base, line| {
