@@ -347,6 +347,10 @@ impl IdTable {
         let cap = (est * 2).max(1024).next_power_of_two();
         IdTable { slots: vec![u32::MAX; cap], keys: Vec::with_capacity(est), mask: cap - 1 }
     }
+    #[inline(always)]
+    fn prefetch(&self, key: u64) {
+        prefetch(unsafe { self.slots.as_ptr().add((PKey(key).hash() as usize) & self.mask) });
+    }
     #[inline]
     fn get_or_insert(&mut self, key: u64) -> u32 {
         if self.keys.len() * 4 >= self.slots.len() * 3 {
@@ -391,12 +395,19 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// Builds the link map from parsed links: dense ids, union-find, byte-minimal name per component.
 fn build_link_map(links: &[LinkRaw]) -> LinkMap {
     let n_lines = links.len();
-    let mut table = IdTable::new(n_lines + 64);
+    let mut table = IdTable::new(n_lines * 2 + 64);
     let mut edges: Vec<(u32, u32)> = Vec::with_capacity(n_lines);
-    for l in links {
-        let a = table.get_or_insert(l.a.0);
-        let b = table.get_or_insert(l.b.0);
-        edges.push((a, b));
+    const B: usize = 16;
+    for chunk in links.chunks(B) {
+        for l in chunk {
+            table.prefetch(l.a.0);
+            table.prefetch(l.b.0);
+        }
+        for l in chunk {
+            let a = table.get_or_insert(l.a.0);
+            let b = table.get_or_insert(l.b.0);
+            edges.push((a, b));
+        }
     }
     let n = table.keys.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -448,8 +459,14 @@ fn build_link_map(links: &[LinkRaw]) -> LinkMap {
         }
     }
     let mut map = LinkMap::new(n);
-    for u in 0..n {
-        map.insert(table.keys[u], best_key[root_of[u] as usize]);
+    for u0 in (0..n).step_by(B) {
+        let u1 = (u0 + B).min(n);
+        for u in u0..u1 {
+            map.prefetch(PKey(table.keys[u]).hash());
+        }
+        for u in u0..u1 {
+            map.insert(table.keys[u], best_key[root_of[u] as usize]);
+        }
     }
     map
 }
