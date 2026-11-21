@@ -634,6 +634,20 @@ fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
 
 // ---------- sorting and walking ----------
 
+/// Insertion sort for short runs (the common per-person case): no setup cost.
+#[inline(always)]
+fn insertion_sort_u64(v: &mut [u64]) {
+    for i in 1..v.len() {
+        let x = v[i];
+        let mut j = i;
+        while j > 0 && v[j - 1] > x {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
 /// LSD radix sort of u64 keys on the top 32 bits only (the timestamp).
 fn radix_sort_u64(v: &mut [u64], tmp: &mut Vec<u64>) {
     let n = v.len();
@@ -982,13 +996,25 @@ fn person_partition(
         }
         let (cs, ce) = (cstart[l] as usize, cstart[l + 1] as usize);
         let ev = &mut ev_sorted[es..ee];
-        if ev.len() >= 4096 {
+        if ev.len() <= 32 {
+            insertion_sort_u64(ev);
+        } else if ev.len() >= 4096 {
             radix_sort_u64(ev, radix_tmp);
         } else {
             ev.sort_unstable();
         }
         let cl = &mut cl_sorted[cs..ce];
-        cl.sort_unstable_by(click_order);
+        if cl.len() <= 24 {
+            for i in 1..cl.len() {
+                let mut j = i;
+                while j > 0 && click_order(&cl[j - 1], &cl[j]) == std::cmp::Ordering::Greater {
+                    cl.swap(j - 1, j);
+                    j -= 1;
+                }
+            }
+        } else {
+            cl.sort_unstable_by(click_order);
+        }
         if timing {
             tick(true, &T_PERSON[2], &mut tm);
         }

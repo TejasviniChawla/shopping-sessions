@@ -206,29 +206,7 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
     if cm.count_ones() as usize != N - 1 {
         return false;
     }
-    if qm == 0 {
-        // fast path: no quotes; comma positions from the two 64-bit halves
-        let mut s = 0usize;
-        let mut k = 0;
-        let mut w = cm as u64;
-        while w != 0 {
-            let e = w.trailing_zeros() as usize;
-            w &= w - 1;
-            out[k] = unsafe { line.get_unchecked(s..e) };
-            s = e + 1;
-            k += 1;
-        }
-        let mut w = (cm >> 64) as u64;
-        while w != 0 {
-            let e = 64 + w.trailing_zeros() as usize;
-            w &= w - 1;
-            out[k] = unsafe { line.get_unchecked(s..e) };
-            s = e + 1;
-            k += 1;
-        }
-        out[N - 1] = unsafe { line.get_unchecked(s..n) };
-        return true;
-    }
+    // One path for quoted and unquoted lines (a per-line branch on `qm == 0` mispredicts on this data).
     // quotes: a quote is valid only as the first and last byte of a field of length >= 2.
     // Per non-empty field, extract its open and close bits with pext (one bit per field, in field order);
     // the line is valid iff the two patterns agree. Empty fields have no first/last byte and no quotes.
