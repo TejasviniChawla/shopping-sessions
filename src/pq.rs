@@ -5,9 +5,12 @@ use std::io::Write;
 
 pub enum Col<'a> {
     I64(&'a str, &'a [i64]),
+    I32(&'a str, &'a [i32]),
     Date(&'a str, &'a [i32]),
     /// strings as (offsets, bytes); offsets.len() == n + 1; `valid` None = all present
     Str(&'a str, &'a [u32], &'a [u8], Option<&'a [bool]>),
+    /// strings with dictionary encoding (RLE_DICTIONARY): best when consecutive rows repeat values
+    DictStr(&'a str, &'a [u32], &'a [u8]),
 }
 
 const PAGE_ROWS: usize = 1 << 16;
@@ -69,6 +72,11 @@ impl Thrift {
 }
 
 fn page_header(num_values: usize, uncompressed: usize, compressed: usize) -> Vec<u8> {
+    data_page_header(num_values, uncompressed, compressed, 0)
+}
+
+/// Data page v1 header; `encoding` 0 = PLAIN, 8 = RLE_DICTIONARY.
+fn data_page_header(num_values: usize, uncompressed: usize, compressed: usize, encoding: i32) -> Vec<u8> {
     let mut t = Thrift(Vec::with_capacity(32));
     let mut l = 0i16;
     t.i32f(&mut l, 1, 0); // DATA_PAGE
@@ -78,13 +86,62 @@ fn page_header(num_values: usize, uncompressed: usize, compressed: usize) -> Vec
     {
         let mut l2 = 0i16;
         t.i32f(&mut l2, 1, num_values as i32);
-        t.i32f(&mut l2, 2, 0); // PLAIN
+        t.i32f(&mut l2, 2, encoding);
         t.i32f(&mut l2, 3, 3); // RLE
         t.i32f(&mut l2, 4, 3); // RLE
         t.stop();
     }
     t.stop();
     t.0
+}
+
+/// Dictionary page header (PLAIN-encoded dictionary values).
+fn dict_page_header(num_values: usize, uncompressed: usize, compressed: usize) -> Vec<u8> {
+    let mut t = Thrift(Vec::with_capacity(32));
+    let mut l = 0i16;
+    t.i32f(&mut l, 1, 2); // DICTIONARY_PAGE
+    t.i32f(&mut l, 2, uncompressed as i32);
+    t.i32f(&mut l, 3, compressed as i32);
+    t.struct_begin(&mut l, 7);
+    {
+        let mut l2 = 0i16;
+        t.i32f(&mut l2, 1, num_values as i32);
+        t.i32f(&mut l2, 2, 2); // PLAIN_DICTIONARY (the dictionary page itself is PLAIN)
+        t.stop();
+    }
+    t.stop();
+    t.0
+}
+
+/// RLE/bit-packed hybrid of dictionary indices for a data page: 1-byte bit width, then bit-packed groups of 8.
+fn dict_indices(idx: &[u32], width: u32) -> Vec<u8> {
+    let n = idx.len();
+    let groups = (n + 7) / 8;
+    let mut out = Vec::with_capacity(2 + groups * width as usize + 8);
+    out.push(width as u8);
+    let mut v = ((groups as u64) << 1) | 1;
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+    // pack `width` bits per value, LSB first, 8 values per group -> width bytes per group
+    let mut acc: u64 = 0;
+    let mut nbits = 0u32;
+    for g in 0..groups {
+        for b in 0..8 {
+            let i = g * 8 + b;
+            let val = if i < n { idx[i] as u64 } else { 0 };
+            acc |= val << nbits;
+            nbits += width;
+            while nbits >= 8 {
+                out.push(acc as u8);
+                acc >>= 8;
+                nbits -= 8;
+            }
+        }
+    }
+    out
 }
 
 /// Definition levels (bit width 1) as RLE/bit-packed hybrid with the v1 4-byte length prefix.
@@ -124,6 +181,7 @@ struct ChunkMeta {
     bytes: i64,
     raw_bytes: i64,
     data_page_offset: i64,
+    dict_page_offset: Option<i64>,
 }
 
 pub fn write(path: &std::path::Path, cols: &[Col], nrows: usize) -> std::io::Result<()> {
@@ -143,9 +201,86 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
         let mut raw_total = 0u64;
         let (ty, name) = match c {
             Col::I64(n, _) => (2, *n),
+            Col::I32(n, _) => (1, *n),
             Col::Date(n, _) => (1, *n),
             Col::Str(n, _, _, _) => (6, *n),
+            Col::DictStr(n, _, _) => (6, *n),
         };
+        let mut dict_page_offset = None;
+        let mut first_data_page: Option<u64> = None;
+        if let Col::DictStr(_, offs, bytes) = c {
+            // build the dictionary over the whole chunk (consecutive duplicates are the common case)
+            let mut dict_bytes: Vec<u8> = Vec::with_capacity(bytes.len() / 2 + 16);
+            let mut ids: Vec<u32> = Vec::with_capacity(nrows);
+            let mut map: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::with_capacity(nrows / 2 + 16);
+            let mut last: Option<(&[u8], u32)> = None;
+            for i in 0..nrows {
+                let sl = &bytes[offs[i] as usize..offs[i + 1] as usize];
+                let id = match last {
+                    Some((p, id)) if p == sl => id,
+                    _ => {
+                        let next = map.len() as u32;
+                        let id = *map.entry(sl).or_insert_with(|| {
+                            dict_bytes.extend_from_slice(&(sl.len() as u32).to_le_bytes());
+                            dict_bytes.extend_from_slice(sl);
+                            next
+                        });
+                        last = Some((sl, id));
+                        id
+                    }
+                };
+                ids.push(id);
+            }
+            let ndict = map.len();
+            let width = if ndict <= 1 { 1 } else { 32 - (ndict as u32 - 1).leading_zeros() };
+            // dictionary page
+            let (hdr, body) = if snappy {
+                let cmp = enc.compress_vec(&dict_bytes).expect("snappy");
+                (dict_page_header(ndict, dict_bytes.len(), cmp.len()), cmp)
+            } else {
+                (dict_page_header(ndict, dict_bytes.len(), dict_bytes.len()), dict_bytes.clone())
+            };
+            dict_page_offset = Some(pos as i64);
+            f.write_all(&hdr)?;
+            f.write_all(&body)?;
+            total += (hdr.len() + body.len()) as u64;
+            raw_total += (hdr.len() + dict_bytes.len()) as u64;
+            // data pages of indices
+            let mut row = 0;
+            while row < nrows || (nrows == 0 && row == 0) {
+                let end = (row + PAGE_ROWS).min(nrows);
+                let page = dict_indices(&ids[row..end], width);
+                let ulen = page.len();
+                let (hdr, body) = if snappy {
+                    let cmp = enc.compress_vec(&page).expect("snappy");
+                    (data_page_header(end - row, ulen, cmp.len(), 8), cmp)
+                } else {
+                    (data_page_header(end - row, ulen, ulen, 8), page)
+                };
+                if first_data_page.is_none() {
+                    first_data_page = Some(pos + total);
+                }
+                f.write_all(&hdr)?;
+                f.write_all(&body)?;
+                total += (hdr.len() + body.len()) as u64;
+                raw_total += (hdr.len() + ulen) as u64;
+                row = end;
+                if nrows == 0 {
+                    break;
+                }
+            }
+            pos += total;
+            metas.push(ChunkMeta {
+                ty,
+                name: name.to_string(),
+                num_values: nrows as i64,
+                bytes: total as i64,
+                raw_bytes: raw_total as i64,
+                data_page_offset: first_data_page.unwrap_or(start) as i64,
+                dict_page_offset,
+            });
+            continue;
+        }
         let mut row = 0;
         while row < nrows || (nrows == 0 && row == 0) {
             let end = (row + PAGE_ROWS).min(nrows);
@@ -156,11 +291,12 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
                         page.extend_from_slice(&x.to_le_bytes());
                     }
                 }
-                Col::Date(_, v) => {
+                Col::Date(_, v) | Col::I32(_, v) => {
                     for x in &v[row..end] {
                         page.extend_from_slice(&x.to_le_bytes());
                     }
                 }
+                Col::DictStr(..) => unreachable!(),
                 Col::Str(_, offs, bytes, valid) => {
                     if let Some(valid) = valid {
                         page.extend_from_slice(&def_levels(&valid[row..end]));
@@ -191,7 +327,7 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
             }
         }
         pos += total;
-        metas.push(ChunkMeta { ty, name: name.to_string(), num_values: nrows as i64, bytes: total as i64, raw_bytes: raw_total as i64, data_page_offset: start as i64 });
+        metas.push(ChunkMeta { ty, name: name.to_string(), num_values: nrows as i64, bytes: total as i64, raw_bytes: raw_total as i64, data_page_offset: start as i64, dict_page_offset });
     }
     // FileMetaData
     let mut t = Thrift(Vec::with_capacity(512));
@@ -218,6 +354,17 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
                     t.strf(&mut l2, 4, n.as_bytes());
                     t.i32f(&mut l2, 6, 6); // DATE
                 }
+                Col::I32(n, _) => {
+                    t.i32f(&mut l2, 1, 1);
+                    t.i32f(&mut l2, 3, 0);
+                    t.strf(&mut l2, 4, n.as_bytes());
+                }
+                Col::DictStr(n, _, _) => {
+                    t.i32f(&mut l2, 1, 6);
+                    t.i32f(&mut l2, 3, 0);
+                    t.strf(&mut l2, 4, n.as_bytes());
+                    t.i32f(&mut l2, 6, 0); // UTF8
+                }
                 Col::Str(n, _, _, valid) => {
                     t.i32f(&mut l2, 1, 6);
                     t.i32f(&mut l2, 3, if valid.is_some() { 1 } else { 0 });
@@ -241,9 +388,16 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
             {
                 let mut l4 = 0i16;
                 t.i32f(&mut l4, 1, m.ty);
-                t.list_begin(&mut l4, 2, 2, 5);
-                t.zig32(0); // PLAIN
-                t.zig32(3); // RLE
+                if m.dict_page_offset.is_some() {
+                    t.list_begin(&mut l4, 2, 3, 5);
+                    t.zig32(2); // PLAIN_DICTIONARY (dictionary page)
+                    t.zig32(8); // RLE_DICTIONARY (data pages)
+                    t.zig32(3); // RLE (levels)
+                } else {
+                    t.list_begin(&mut l4, 2, 2, 5);
+                    t.zig32(0); // PLAIN
+                    t.zig32(3); // RLE
+                }
                 t.list_begin(&mut l4, 3, 1, 8);
                 t.varint(m.name.len() as u64);
                 t.0.extend_from_slice(m.name.as_bytes());
@@ -252,6 +406,9 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
                 t.i64f(&mut l4, 6, m.raw_bytes);
                 t.i64f(&mut l4, 7, m.bytes);
                 t.i64f(&mut l4, 9, m.data_page_offset);
+                if let Some(d) = m.dict_page_offset {
+                    t.i64f(&mut l4, 11, d);
+                }
                 t.stop();
             }
             t.stop();

@@ -1359,8 +1359,8 @@ fn run() {
                         let name = person_name[r.person as usize].bytes(sides, &mut buf);
                         uc.push_user(name);
                         uc.day.push(r.day);
-                        uc.sessions.push(r.sessions as i64);
-                        uc.events.push(r.events as i64);
+                        uc.sessions.push(r.sessions as i32);
+                        uc.events.push(r.events as i32);
                         uc.revenue.push(r.revenue);
                         uc.push_cat(if r.top_cat == u16::MAX { None } else { Some(&ctx.cat_names[r.top_cat as usize][..]) });
                     }
@@ -1393,10 +1393,10 @@ fn run() {
             }
             cc.push_ids(&ctx.camp_names[ci], &ctx.channels[ci]);
             cc.day.push((day0 + d as i64) as i32);
-            cc.sessions.push(c[0]);
-            cc.purchasing_sessions.push(c[1]);
+            cc.sessions.push(c[0] as i32);
+            cc.purchasing_sessions.push(c[1] as i32);
             cc.revenue.push(c[2]);
-            cc.assisted_sessions.push(c[3]);
+            cc.assisted_sessions.push(c[3] as i32);
         }
     }
     out::write_campaign_daily(&outdir.join("campaign_daily"), cc).expect("write campaign_daily");

@@ -107,3 +107,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~02:00 ET: UNIT_KB experiment (same runner, native): 512 KB units halve sys time (1.02 -> 0.50 s) and cut total ~10%.
   Batch 574a577 (512 KB units, 2 MB-aligned maps, pinning, dedup||clicks/links overlap, fast ingest) A/B: 0.71-0.74 vs 0.73-0.82 (f747a2d).
   Replacing arrow/parquet crates with a minimal PLAIN parquet writer (src/pq.rs), validated with polars + pyarrow.
+- 2026-11-22 ~03:30 ET: FOUND: wall - in-container gap depends on OUTPUT BYTES on the bind mount (docker flushes dirty pages
+  at exit): uncompressed parquet (23 MB) costs +0.15 s vs Snappy (9 MB). tmpfs output: no gap. => keep output small (Snappy,
+  INT32 where allowed). Do NOT submit c6d9bbd/cd1ddca/50b5fa0 (uncompressed writer). 574a577 recommended.

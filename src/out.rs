@@ -8,8 +8,8 @@ pub struct UserDailyCols {
     pub uid_offs: Vec<u32>,
     pub uid_bytes: Vec<u8>,
     pub day: Vec<i32>,
-    pub sessions: Vec<i64>,
-    pub events: Vec<i64>,
+    pub sessions: Vec<i32>,
+    pub events: Vec<i32>,
     pub revenue: Vec<i64>,
     pub cat_offs: Vec<u32>,
     pub cat_bytes: Vec<u8>,
@@ -56,10 +56,10 @@ impl UserDailyCols {
 
 pub fn write_user_daily(path: &Path, c: UserDailyCols) -> std::io::Result<()> {
     let cols = [
-        Col::Str("user_id", &c.uid_offs, &c.uid_bytes, None),
+        Col::DictStr("user_id", &c.uid_offs, &c.uid_bytes),
         Col::Date("day", &c.day),
-        Col::I64("sessions", &c.sessions),
-        Col::I64("events", &c.events),
+        Col::I32("sessions", &c.sessions),
+        Col::I32("events", &c.events),
         Col::I64("revenue_cents", &c.revenue),
         Col::Str("top_category", &c.cat_offs, &c.cat_bytes, Some(&c.cat_valid)),
     ];
@@ -72,10 +72,10 @@ pub struct CampaignDailyCols {
     pub ch_offs: Vec<u32>,
     pub ch_bytes: Vec<u8>,
     pub day: Vec<i32>,
-    pub sessions: Vec<i64>,
-    pub purchasing_sessions: Vec<i64>,
+    pub sessions: Vec<i32>,
+    pub purchasing_sessions: Vec<i32>,
     pub revenue: Vec<i64>,
-    pub assisted_sessions: Vec<i64>,
+    pub assisted_sessions: Vec<i32>,
 }
 
 impl CampaignDailyCols {
@@ -104,13 +104,13 @@ impl CampaignDailyCols {
 pub fn write_campaign_daily(dir: &Path, c: CampaignDailyCols) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let cols = [
-        Col::Str("campaign_id", &c.cid_offs, &c.cid_bytes, None),
-        Col::Str("channel", &c.ch_offs, &c.ch_bytes, None),
+        Col::DictStr("campaign_id", &c.cid_offs, &c.cid_bytes),
+        Col::DictStr("channel", &c.ch_offs, &c.ch_bytes),
         Col::Date("day", &c.day),
-        Col::I64("sessions", &c.sessions),
-        Col::I64("purchasing_sessions", &c.purchasing_sessions),
+        Col::I32("sessions", &c.sessions),
+        Col::I32("purchasing_sessions", &c.purchasing_sessions),
         Col::I64("revenue_cents", &c.revenue),
-        Col::I64("assisted_sessions", &c.assisted_sessions),
+        Col::I32("assisted_sessions", &c.assisted_sessions),
     ];
     pq::write(&dir.join("part-0.parquet"), &cols, c.day.len())
 }
