@@ -6,13 +6,13 @@ mod out;
 mod ts;
 mod util;
 
-use csv::{split_fields, split_scanned, Lines, Scanner};
+use csv::{split_scanned, Lines, Scanner};
 use io::{Buffer, Unit};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
-use util::{key_hash, prefetch, Arenas, HugeVec, Key, SmallTable};
+use util::{prefetch, HugeVec, PKey, Side, Sides, SmallTable};
 
 const LOG_P: u32 = 4;
 const P: usize = 1 << LOG_P;
@@ -29,8 +29,8 @@ fn part(h: u64) -> usize {
 
 #[derive(Clone, Copy)]
 struct EvRaw {
-    id: Key,
-    user: Key,
+    id: PKey,
+    user: PKey,
     ts: u32,     // ms since window_start (valid only when flag bit0)
     ingest: i32, // whole seconds since window_start
     price: u32,
@@ -40,9 +40,8 @@ struct EvRaw {
 
 #[derive(Clone, Copy)]
 struct EvValid {
-    user: Key,
-    uhash: u64,
-    ts: i64,
+    user: PKey,
+    ts: u32,
     price: u32,
     cat: u16,
     etype: u8,
@@ -50,7 +49,7 @@ struct EvValid {
 
 #[derive(Clone, Copy)]
 struct EvMid {
-    ts: i64,
+    ts: u32,
     uid: u32,
     price: u32,
     cat: u16,
@@ -59,7 +58,7 @@ struct EvMid {
 
 #[derive(Clone, Copy, Default)]
 struct EvFinal {
-    ts: i64,
+    ts: u32,
     price: u32,
     cat: u16,
     etype: u8,
@@ -67,8 +66,8 @@ struct EvFinal {
 
 #[derive(Clone, Copy)]
 struct ClRaw {
-    id: Key,
-    user: Key,
+    id: PKey,
+    user: PKey,
     ts: u32, // ms since window_start - 7 days (valid only when flag bit0)
     camp: u16,
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 campaign known
@@ -76,34 +75,31 @@ struct ClRaw {
 
 #[derive(Clone, Copy)]
 struct ClValid {
-    id: Key,
-    user: Key,
-    uhash: u64,
-    ts: i64,
+    id: PKey,
+    user: PKey,
+    ts: u32,
     camp: u16,
 }
 
 #[derive(Clone, Copy)]
 struct ClMid {
-    id: Key,
-    ts: i64,
+    id: PKey,
+    ts: u32,
     uid: u32,
     camp: u16,
 }
 
 #[derive(Clone, Copy, Default)]
 struct ClFinal {
-    id: Key,
-    ts: i64,
+    id: PKey,
+    ts: u32,
     camp: u16,
 }
 
 #[derive(Clone, Copy)]
 struct LinkRaw {
-    a: Key,
-    b: Key,
-    ha: u64,
-    hb: u64,
+    a: PKey,
+    b: PKey,
 }
 
 struct Ctx {
@@ -153,7 +149,7 @@ fn read_small_csv(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
             continue;
         }
         let mut f = [&b""[..]; 2];
-        if split_fields(line, &mut f) {
+        if csv::split_fields_scalar(line, &mut f) {
             out.push((f[0].to_vec(), f[1].to_vec()));
         }
     }
@@ -186,11 +182,6 @@ fn parse_price(s: &[u8]) -> Option<u32> {
     }
     let rest = &s[i..];
     if rest.len() > 8 {
-        for &c in rest {
-            if !c.is_ascii_digit() {
-                return None;
-            }
-        }
         return None;
     }
     let mut v: u32 = 0;
@@ -204,7 +195,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 #[inline(always)]
-fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8], masks: Option<(u128, u128)>) -> Option<EvRaw> {
+fn parse_event_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: Option<(u128, u128)>) -> Option<EvRaw> {
     let mut f = [&b""[..]; 7];
     if !split_scanned(line, masks, &mut f) || f[0].is_empty() {
         return None;
@@ -247,11 +238,11 @@ fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8], mas
             }
         }
     }
-    Some(EvRaw { id: Key::new(f[0], aid, arena), user: Key::new(f[1], aid, arena), ts, ingest, price, cat, flags })
+    Some(EvRaw { id: PKey::new(f[0], aid, side), user: PKey::new(f[1], aid, side), ts, ingest, price, cat, flags })
 }
 
 #[inline(always)]
-fn parse_click_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8], masks: Option<(u128, u128)>) -> Option<ClRaw> {
+fn parse_click_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: Option<(u128, u128)>) -> Option<ClRaw> {
     let mut f = [&b""[..]; 4];
     if !split_scanned(line, masks, &mut f) || f[0].is_empty() {
         return None;
@@ -273,31 +264,31 @@ fn parse_click_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8], mas
         flags |= 4;
         camp = c as u16;
     }
-    Some(ClRaw { id: Key::new(f[0], aid, arena), user: Key::new(f[1], aid, arena), ts, camp, flags })
+    Some(ClRaw { id: PKey::new(f[0], aid, side), user: PKey::new(f[1], aid, side), ts, camp, flags })
 }
 
-/// Generic parallel parse over work units; each thread produces P partition vectors and one arena.
+/// Generic parallel parse over work units; each thread produces P partition vectors and one Side table.
 fn parse_parallel<T: Copy + Send, F>(
     ctx: &Ctx,
     inputs: &io::Inputs,
     units: &[Unit],
-    arena_base: usize,
+    aid_base: usize,
     f: F,
-) -> (Vec<Vec<HugeVec<T>>>, Vec<Vec<u8>>)
+) -> (Vec<Vec<HugeVec<T>>>, Vec<Side>)
 where
-    F: Fn(&Ctx, usize, &mut Vec<u8>, &[u8], Option<(u128, u128)>) -> Option<(usize, T)> + Sync,
+    F: Fn(&Ctx, usize, &mut Side, &[u8], Option<(u128, u128)>) -> Option<(usize, T)> + Sync,
 {
     let next = AtomicUsize::new(0);
     let total_bytes: u64 = units.iter().map(|u| u.end - u.start).sum();
     let est = (total_bytes / 60) as usize / ctx.nthreads / P + 1024;
-    let results: Vec<(Vec<HugeVec<T>>, Vec<u8>)> = std::thread::scope(|s| {
+    let results: Vec<(Vec<HugeVec<T>>, Side)> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for t in 0..ctx.nthreads {
             let next = &next;
             let f = &f;
             handles.push(s.spawn(move || {
-                let aid = arena_base + t;
-                let mut arena: Vec<u8> = Vec::new();
+                let aid = aid_base + t;
+                let mut side = Side::new();
                 let mut out: Vec<HugeVec<T>> = (0..P).map(|_| HugeVec::with_capacity(est)).collect();
                 let mut buf = Buffer::new();
                 loop {
@@ -311,39 +302,38 @@ where
                     let data = buf.data();
                     let mut sc = Scanner::new(data, lo, hi);
                     while let Some((line, masks)) = sc.next() {
-                        if let Some((p, rec)) = f(ctx, aid, &mut arena, line, masks) {
+                        if let Some((p, rec)) = f(ctx, aid, &mut side, line, masks) {
                             out[p].push(rec);
                         }
                     }
                 }
-                (out, arena)
+                (out, side)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut outs = Vec::with_capacity(results.len());
-    let mut arenas = Vec::with_capacity(results.len());
+    let mut sides = Vec::with_capacity(results.len());
     for (o, a) in results {
         outs.push(o);
-        arenas.push(a);
+        sides.push(a);
     }
-    (outs, arenas)
+    (outs, sides)
 }
 
 // ---------- dedup ----------
 
 /// Per partition p: dedup event copies by event_id keeping min ingest, validate, scatter by user hash.
-fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<HugeVec<EvValid>> {
+fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<HugeVec<EvValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     let cap = (total * 2).max(16).next_power_of_two();
     let mask = cap - 1;
-    // slot -> (packed record index, hash); hash stored to avoid touching records on probe misses
-    let mut slots: HugeVec<(u32, u64)> = HugeVec::with_len_uninit(cap);
+    // slot -> (packed record index, key); key stored so probes never touch records
+    let mut slots: HugeVec<(u32, PKey)> = HugeVec::with_len_uninit(cap);
     for s in slots.iter_mut() {
-        *s = (u32::MAX, 0);
+        *s = (u32::MAX, PKey(0));
     }
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
-    // dense offsets per thread vector for the winner bitmap
     let mut off = vec![0usize; raws.len() + 1];
     for t in 0..raws.len() {
         off[t + 1] = off[t] + raws[t][p].len();
@@ -353,41 +343,34 @@ fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<EvRaw>>], p: usiz
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
         let n = recs.len();
-        let mut hs = [0u64; D];
         for i in 0..n.min(D) {
-            let h = key_hash(&recs[i].id, files);
-            hs[i] = h;
-            prefetch(unsafe { slots.as_ptr().add((h as usize) & mask) });
+            prefetch(unsafe { slots.as_ptr().add((recs[i].id.hash(sides) as usize) & mask) });
         }
         for i in 0..n {
             let r = &recs[i];
-            let h = hs[i % D];
             if i + D < n {
-                let h2 = key_hash(&recs[i + D].id, files);
-                hs[i % D] = h2;
-                prefetch(unsafe { slots.as_ptr().add((h2 as usize) & mask) });
+                prefetch(unsafe { slots.as_ptr().add((recs[i + D].id.hash(sides) as usize) & mask) });
             }
+            let h = r.id.hash(sides);
             let packed = ((t as u32) << 27) | (i as u32);
             let dense = off[t] + i;
             let mut s = (h as usize) & mask;
             loop {
-                let (cur, ch) = slots[s];
+                let (cur, ck) = slots[s];
                 if cur == u32::MAX {
-                    slots[s] = (packed, h);
+                    slots[s] = (packed, r.id);
                     win[dense >> 6] |= 1 << (dense & 63);
                     break;
                 }
-                if ch == h {
+                if ck.same(&r.id, sides) {
                     let o = get(cur);
-                    if o.id.same(&r.id, files) {
-                        if r.ingest < o.ingest {
-                            slots[s] = (packed, h);
-                            let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
-                            win[od >> 6] &= !(1 << (od & 63));
-                            win[dense >> 6] |= 1 << (dense & 63);
-                        }
-                        break;
+                    if r.ingest < o.ingest {
+                        slots[s] = (packed, r.id);
+                        let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
+                        win[od >> 6] &= !(1 << (od & 63));
+                        win[dense >> 6] |= 1 << (dense & 63);
                     }
+                    break;
                 }
                 s = (s + 1) & mask;
             }
@@ -395,7 +378,6 @@ fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<EvRaw>>], p: usiz
     }
     drop(slots);
     let mut out: Vec<HugeVec<EvValid>> = (0..P).map(|_| HugeVec::with_capacity(total / P + 1024)).collect();
-    // Second pass in record order: winners by bitmap, then validate and scatter by user hash.
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
         for (i, r) in recs.iter().enumerate() {
@@ -411,58 +393,48 @@ fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<EvRaw>>], p: usiz
             if !ok {
                 continue;
             }
-            let uhash = key_hash(&r.user, files);
-            out[part(uhash)].push(EvValid { user: r.user, uhash, ts: ctx.ws + r.ts as i64, price: r.price, cat: r.cat, etype });
+            out[part(r.user.hash(sides))].push(EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype });
         }
     }
     out
 }
 
-fn dedup_clicks(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
+fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     let cap = (total * 2).max(16).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: HugeVec<(u32, u64)> = HugeVec::with_len_uninit(cap);
+    let mut slots: HugeVec<(u32, PKey)> = HugeVec::with_len_uninit(cap);
     for s in slots.iter_mut() {
-        *s = (u32::MAX, 0);
+        *s = (u32::MAX, PKey(0));
     }
-    let get = |packed: u32| -> &ClRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     let mut out: Vec<HugeVec<ClValid>> = (0..P).map(|_| HugeVec::with_capacity(total / P + 1024)).collect();
-    let lo = ctx.ws - REACH;
     const D: usize = 8;
-    for (t, tv) in raws.iter().enumerate() {
+    for tv in raws.iter() {
         let recs = &tv[p][..];
         let n = recs.len();
-        let mut hs = [0u64; D];
         for i in 0..n.min(D) {
-            let h = key_hash(&recs[i].id, files);
-            hs[i] = h;
-            prefetch(unsafe { slots.as_ptr().add((h as usize) & mask) });
+            prefetch(unsafe { slots.as_ptr().add((recs[i].id.hash(sides) as usize) & mask) });
         }
         for i in 0..n {
             let r = &recs[i];
-            let h = hs[i % D];
             if i + D < n {
-                let h2 = key_hash(&recs[i + D].id, files);
-                hs[i % D] = h2;
-                prefetch(unsafe { slots.as_ptr().add((h2 as usize) & mask) });
+                prefetch(unsafe { slots.as_ptr().add((recs[i + D].id.hash(sides) as usize) & mask) });
             }
-            let packed = ((t as u32) << 27) | (i as u32);
+            let h = r.id.hash(sides);
             let mut s = (h as usize) & mask;
             let fresh = loop {
-                let (cur, ch) = slots[s];
+                let (cur, ck) = slots[s];
                 if cur == u32::MAX {
-                    slots[s] = (packed, h);
+                    slots[s] = (0, r.id);
                     break true;
                 }
-                if ch == h && get(cur).id.same(&r.id, files) {
+                if ck.same(&r.id, sides) {
                     break false;
                 }
                 s = (s + 1) & mask;
             };
             if fresh && (r.flags & 7) == 7 {
-                let uhash = key_hash(&r.user, files);
-                out[part(uhash)].push(ClValid { id: r.id, user: r.user, uhash, ts: lo + r.ts as i64, camp: r.camp });
+                out[part(r.user.hash(sides))].push(ClValid { id: r.id, user: r.user, ts: r.ts, camp: r.camp });
             }
         }
     }
@@ -473,7 +445,7 @@ fn dedup_clicks(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<ClRaw>>], p: usiz
 
 struct Intern {
     slots: Vec<u32>,
-    keys: Vec<(u64, Key)>,
+    keys: Vec<PKey>,
     mask: usize,
 }
 
@@ -482,12 +454,12 @@ impl Intern {
         let cap = (est * 2).max(64).next_power_of_two();
         Intern { slots: vec![u32::MAX; cap], keys: Vec::with_capacity(est), mask: cap - 1 }
     }
-    fn grow(&mut self) {
+    fn grow(&mut self, sides: &Sides) {
         let cap = self.slots.len() * 2;
         let mask = cap - 1;
         let mut slots = vec![u32::MAX; cap];
-        for (i, (h, _)) in self.keys.iter().enumerate() {
-            let mut s = (*h as usize) & mask;
+        for (i, k) in self.keys.iter().enumerate() {
+            let mut s = (k.hash(sides) as usize) & mask;
             while slots[s] != u32::MAX {
                 s = (s + 1) & mask;
             }
@@ -497,36 +469,33 @@ impl Intern {
         self.mask = mask;
     }
     #[inline]
-    fn insert(&mut self, h: u64, r: Key, files: &Arenas) -> u32 {
+    fn insert(&mut self, k: PKey, sides: &Sides) -> u32 {
         if self.keys.len() * 4 >= self.slots.len() * 3 {
-            self.grow();
+            self.grow(sides);
         }
-        let b = r;
-        let mut s = (h as usize) & self.mask;
+        let mut s = (k.hash(sides) as usize) & self.mask;
         loop {
             let cur = self.slots[s];
             if cur == u32::MAX {
                 self.slots[s] = self.keys.len() as u32;
-                self.keys.push((h, r));
+                self.keys.push(k);
                 return (self.keys.len() - 1) as u32;
             }
-            let k = &self.keys[cur as usize];
-            if k.0 == h && k.1.same(&b, files) {
+            if self.keys[cur as usize].same(&k, sides) {
                 return cur;
             }
             s = (s + 1) & self.mask;
         }
     }
     #[inline]
-    fn lookup(&self, h: u64, b: &Key, files: &Arenas) -> Option<u32> {
-        let mut s = (h as usize) & self.mask;
+    fn lookup(&self, k: &PKey, sides: &Sides) -> Option<u32> {
+        let mut s = (k.hash(sides) as usize) & self.mask;
         loop {
             let cur = self.slots[s];
             if cur == u32::MAX {
                 return None;
             }
-            let k = &self.keys[cur as usize];
-            if k.0 == h && k.1.same(&b, files) {
+            if self.keys[cur as usize].same(k, sides) {
                 return Some(cur);
             }
             s = (s + 1) & self.mask;
@@ -541,7 +510,7 @@ struct Partition {
 }
 
 fn intern_partition(
-    files: &Arenas,
+    sides: &Sides,
     links: &[Vec<HugeVec<LinkRaw>>],
     evv: &[Vec<HugeVec<EvValid>>],
     clv: &[Vec<HugeVec<ClValid>>],
@@ -551,17 +520,16 @@ fn intern_partition(
     let ncl: usize = clv.iter().map(|v| v[q].len()).sum();
     let nl: usize = links.iter().map(|t| t[q].len()).sum();
     let mut table = Intern::new(nl * 2 + nev / 8 + ncl / 8 + 64);
-    // link endpoints that hash into this partition (links were partitioned by hash of side a; side b checked)
     for t in links {
         for l in t[q].iter() {
-            table.insert(l.ha, l.a, files);
+            table.insert(l.a, sides);
         }
     }
     for t in links {
         for lp in t.iter() {
             for l in lp.iter() {
-                if part(l.hb) == q {
-                    table.insert(l.hb, l.b, files);
+                if part(l.b.hash(sides)) == q {
+                    table.insert(l.b, sides);
                 }
             }
         }
@@ -569,14 +537,14 @@ fn intern_partition(
     let mut events: HugeVec<EvMid> = HugeVec::with_capacity(nev);
     for v in evv {
         for e in v[q].iter() {
-            let uid = table.insert(e.uhash, e.user, files);
+            let uid = table.insert(e.user, sides);
             events.push(EvMid { ts: e.ts, uid, price: e.price, cat: e.cat, etype: e.etype });
         }
     }
     let mut clicks: HugeVec<ClMid> = HugeVec::with_capacity(ncl);
     for v in clv {
         for c in v[q].iter() {
-            let uid = table.insert(c.uhash, c.user, files);
+            let uid = table.insert(c.user, sides);
             clicks.push(ClMid { id: c.id, ts: c.ts, uid, camp: c.camp });
         }
     }
@@ -609,6 +577,7 @@ struct URow {
 
 struct Walker<'a> {
     ctx: &'a Ctx,
+    sides: &'a Sides,
     day0: i64,
     ndays: usize,
     cat_sum: Vec<i64>,
@@ -620,9 +589,10 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
-    fn new(ctx: &'a Ctx, day0: i64, ndays: usize) -> Self {
+    fn new(ctx: &'a Ctx, sides: &'a Sides, day0: i64, ndays: usize) -> Self {
         Walker {
             ctx,
+            sides,
             day0,
             ndays,
             cat_sum: vec![0; ctx.ncat as usize + 1],
@@ -654,14 +624,17 @@ impl<'a> Walker<'a> {
         self.rows.push(URow { person, day: day as i32, sessions, events, revenue, top_cat: top });
     }
 
+    /// `ev` sorted by ts; `cl` sorted by (ts, id bytes). Timestamps are u32 offsets: events from ws, clicks from ws-7d.
     fn walk(&mut self, person: u32, ev: &[EvFinal], cl: &[ClFinal]) {
         let ndays = self.ndays;
+        let ws = self.ctx.ws;
+        let cl_base = ws - REACH;
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut i = 0usize;
         let mut cur_day = i64::MIN;
         let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0i64);
         while i < ev.len() {
-            let start = ev[i].ts;
+            let start = ws + ev[i].ts as i64;
             let day = start.div_euclid(DAY);
             if day != cur_day {
                 if cur_day != i64::MIN {
@@ -687,7 +660,7 @@ impl<'a> Walker<'a> {
                     self.cat_sum[c] += e.price as i64;
                 }
                 j += 1;
-                if j >= ev.len() || ev[j].ts - ev[j - 1].ts > SESSION_GAP {
+                if j >= ev.len() || (ev[j].ts as i64 - ev[j - 1].ts as i64) > SESSION_GAP {
                     break;
                 }
             }
@@ -695,12 +668,12 @@ impl<'a> Walker<'a> {
             d_sessions += 1;
             d_events += cnt;
             d_revenue += rev;
-            // attribution
-            while hi < cl.len() && cl[hi].ts <= start {
+            // attribution: click window [start - 7d, start]
+            while hi < cl.len() && cl_base + cl[hi].ts as i64 <= start {
                 hi += 1;
             }
             let lb = start - REACH;
-            while lo < hi && cl[lo].ts < lb {
+            while lo < hi && cl_base + (cl[lo].ts as i64) < lb {
                 lo += 1;
             }
             let di = (day - self.day0) as usize;
@@ -735,7 +708,6 @@ impl<'a> Walker<'a> {
     }
 }
 
-
 /// Micro-benchmark of the parse stages on the event files, single-threaded. Enabled with BENCH=1.
 fn bench(ctx: &Ctx, inputs: &io::Inputs) {
     let units = &inputs.events;
@@ -765,13 +737,13 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
     eprintln!("bench +split_fields: {} {:.3}s", ok, t.elapsed().as_secs_f64());
     let t = Instant::now();
     let mut acc = 0u64;
-    let mut arena = Vec::new();
+    let mut side = Side::new();
     for &u in units {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
         let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
         while let Some((l, m)) = sc.next() {
-            if let Some(r) = parse_event_line(ctx, 0, &mut arena, l, m) {
-                acc = acc.wrapping_add(r.ts as u64 ^ r.price as u64);
+            if let Some(r) = parse_event_line(ctx, 0, &mut side, l, m) {
+                acc = acc.wrapping_add(r.ts as u64 ^ r.price as u64 ^ r.id.0);
             }
         }
     }
@@ -782,9 +754,8 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
         let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
         while let Some((l, m)) = sc.next() {
-            if let Some(r) = parse_event_line(ctx, 0, &mut arena, l, m) {
-                let h = key_hash(&r.id, std::slice::from_ref(&arena));
-                out[part(h)].push(r);
+            if let Some(r) = parse_event_line(ctx, 0, &mut side, l, m) {
+                out[part(r.id.hash_in(&side))].push(r);
             }
         }
     }
@@ -806,7 +777,6 @@ fn main() {
                     libc::close(fds[1]);
                     let mut b = 0u8;
                     let n = libc::read(fds[0], &mut b as *mut u8 as *mut libc::c_void, 1);
-                    // child wrote a byte only after finishing successfully
                     libc::_exit(if n == 1 && b == 1 { 0 } else { 1 });
                 } else if pid == 0 {
                     libc::close(fds[0]);
@@ -815,7 +785,6 @@ fn main() {
                     libc::write(fds[1], &b as *const u8 as *const libc::c_void, 1);
                     libc::_exit(0);
                 }
-                // fork failed: fall through and run inline
             }
         }
     }
@@ -833,7 +802,6 @@ fn run() {
         .clamp(1, 16);
 
     let (ws, we) = read_manifest(&data.join("manifest.json"));
-    // Timestamps are stored as u32 ms offsets from the window start (events) or start - 7 days (clicks).
     assert!(we > ws && (we - ws + REACH) < u32::MAX as i64, "window too wide for u32 ms offsets");
     let prods = read_small_csv(&data.join("products.csv"));
     let camps = read_small_csv(&data.join("campaigns.csv"));
@@ -877,19 +845,7 @@ fn run() {
     channels.push(b"organic".to_vec());
 
     let inputs = io::discover(&data);
-    let ctx = Ctx {
-        ws,
-        we,
-        products,
-        campaigns,
-        ncat,
-        cat_names,
-        cat_rank,
-        ncamp,
-        camp_names,
-        channels,
-        nthreads,
-    };
+    let ctx = Ctx { ws, we, products, campaigns, ncat, cat_names, cat_rank, ncamp, camp_names, channels, nthreads };
     log(&t0, &format!("setup: {} files, {} threads, {} event units", inputs.files.len(), nthreads, inputs.events.len()));
     if std::env::var("BENCH").is_ok() {
         bench(&ctx, &inputs);
@@ -897,31 +853,28 @@ fn run() {
     }
 
     // Phase 1: parse
-    let (ev_raw, ar_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, arena, line, masks| {
-        parse_event_line(c, aid, arena, line, masks).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
+    let (ev_raw, sd_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, side, line, masks| {
+        parse_event_line(c, aid, side, line, masks).map(|r| (part(r.id.hash_in(side)), r))
     });
     log(&t0, "events parsed");
-    let (cl_raw, ar_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, arena, line, masks| {
-        parse_click_line(c, aid, arena, line, masks).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
+    let (cl_raw, sd_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, side, line, masks| {
+        parse_click_line(c, aid, side, line, masks).map(|r| (part(r.id.hash_in(side)), r))
     });
-    let (links, ar_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, arena, line, masks| {
+    let (links, sd_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, side, line, masks| {
         let mut f = [&b""[..]; 2];
         if !split_scanned(line, masks, &mut f) || f[0].is_empty() || f[1].is_empty() {
             return None;
         }
-        let a = Key::new(f[0], aid, arena);
-        let b = Key::new(f[1], aid, arena);
-        let ar = std::slice::from_ref(&*arena);
-        let ha = key_hash(&a, ar);
-        let hb = key_hash(&b, ar);
-        Some((part(ha), LinkRaw { a, b, ha, hb }))
+        let a = PKey::new(f[0], aid, side);
+        let b = PKey::new(f[1], aid, side);
+        Some((part(a.hash_in(side)), LinkRaw { a, b }))
     });
     log(&t0, "clicks+links parsed");
-    let mut arenas: Vec<Vec<u8>> = Vec::with_capacity(3 * nthreads);
-    arenas.extend(ar_e);
-    arenas.extend(ar_c);
-    arenas.extend(ar_l);
-    let files: &Arenas = &arenas[..];
+    let mut sides_v: Vec<Side> = Vec::with_capacity(3 * nthreads);
+    sides_v.extend(sd_e);
+    sides_v.extend(sd_c);
+    sides_v.extend(sd_l);
+    let sides: &Sides = &sides_v[..];
     drop(inputs);
 
     // Phase 2: dedup + validate, per partition
@@ -934,7 +887,6 @@ fn run() {
         std::thread::scope(|s| {
             for _ in 0..nthreads {
                 let next = &next;
-                let ctx = &ctx;
                 let ev_raw = &ev_raw;
                 let cl_raw = &cl_raw;
                 s.spawn(move || loop {
@@ -943,10 +895,10 @@ fn run() {
                         break;
                     }
                     if i < P {
-                        let r = dedup_events(ctx, files, ev_raw, i);
+                        let r = dedup_events(sides, ev_raw, i);
                         unsafe { *evp.p().add(i) = Some(r) };
                     } else {
-                        let r = dedup_clicks(ctx, files, cl_raw, i - P);
+                        let r = dedup_clicks(sides, cl_raw, i - P);
                         unsafe { *clp.p().add(i - P) = Some(r) };
                     }
                 });
@@ -973,7 +925,7 @@ fn run() {
                     if q >= P {
                         break;
                     }
-                    let r = intern_partition(files, links, evv, clv, q);
+                    let r = intern_partition(sides, links, evv, clv, q);
                     unsafe { *pp.p().add(q) = Some(r) };
                 });
             }
@@ -994,10 +946,10 @@ fn run() {
     for t in &links {
         for lp in t {
             for l in lp.iter() {
-                let qa = part(l.ha);
-                let qb = part(l.hb);
-                let ua = base[qa] + parts[qa].table.lookup(l.ha, &l.a, files).expect("link a");
-                let ub = base[qb] + parts[qb].table.lookup(l.hb, &l.b, files).expect("link b");
+                let qa = part(l.a.hash(sides));
+                let qb = part(l.b.hash(sides));
+                let ua = base[qa] + parts[qa].table.lookup(&l.a, sides).expect("link a");
+                let ub = base[qb] + parts[qb].table.lookup(&l.b, sides).expect("link b");
                 let ra = find(&mut parent, ua);
                 let rb = find(&mut parent, ub);
                 if ra != rb {
@@ -1011,27 +963,24 @@ fn run() {
         }
     }
     drop(links);
-    // id refs in global order
-    let mut id_ref: Vec<Key> = Vec::with_capacity(n_ids);
+    let mut id_key: Vec<PKey> = Vec::with_capacity(n_ids);
     for q in 0..P {
-        for k in &parts[q].table.keys {
-            id_ref.push(k.1);
-        }
+        id_key.extend_from_slice(&parts[q].table.keys);
     }
     // roots, names, person indexes
     let mut person_of_uid = vec![u32::MAX; n_ids];
-    let mut person_name: Vec<Key> = Vec::new();
+    let mut person_name: Vec<PKey> = Vec::new();
     for u in 0..n_ids as u32 {
         let r = find(&mut parent, u);
         if person_of_uid[r as usize] == u32::MAX {
             person_of_uid[r as usize] = person_name.len() as u32;
-            person_name.push(id_ref[r as usize]);
+            person_name.push(id_key[r as usize]);
         }
         let pi = person_of_uid[r as usize];
         if r != u {
             person_of_uid[u as usize] = pi;
-            if id_ref[u as usize].cmp_bytes(&person_name[pi as usize], files) == std::cmp::Ordering::Less {
-                person_name[pi as usize] = id_ref[u as usize];
+            if id_key[u as usize].cmp_bytes(&person_name[pi as usize], sides) == std::cmp::Ordering::Less {
+                person_name[pi as usize] = id_key[u as usize];
             }
         }
     }
@@ -1065,7 +1014,7 @@ fn run() {
     drop(parts);
     log(&t0, &format!("grouped {} events, {} clicks", n_ev, n_cl));
 
-    // Phase 5: per-person walk
+    // Phase 5: per-person walk, each thread writes its own user_daily part
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let next = AtomicUsize::new(0);
@@ -1082,7 +1031,7 @@ fn run() {
             let (ev_start, cl_start) = (&ev_start, &cl_start);
             let (person_name, user_dir) = (&person_name, &user_dir);
             hs.push(s.spawn(move || {
-                let mut w = Walker::new(ctx, day0, ndays);
+                let mut w = Walker::new(ctx, sides, day0, ndays);
                 loop {
                     let b = next.fetch_add(1, Ordering::Relaxed) * BLOCK;
                     if b >= n_persons {
@@ -1097,16 +1046,16 @@ fn run() {
                         let ev = unsafe { std::slice::from_raw_parts_mut(evp.p().add(es), ee - es) };
                         let cl = unsafe { std::slice::from_raw_parts_mut(clp.p().add(cs), ce - cs) };
                         ev.sort_unstable_by_key(|e| e.ts);
-                        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, files)));
+                        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, sides)));
                         w.walk(p as u32, ev, cl);
                     }
                 }
-                // write this thread's user_daily rows as its own parquet part (thread 0 always writes a file)
                 let n_rows = w.rows.len();
                 if n_rows > 0 || t == 0 {
                     let mut uc = out::UserDailyCols::new(n_rows);
+                    let mut buf = [0u8; 12];
                     for r in &w.rows {
-                        let name = person_name[r.person as usize].bytes(files);
+                        let name = person_name[r.person as usize].bytes(sides, &mut buf);
                         uc.user_id.append_value(unsafe { std::str::from_utf8_unchecked(name) });
                         uc.day.push(r.day);
                         uc.sessions.push(r.sessions as i64);
@@ -1170,7 +1119,6 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     uid_of: impl Fn(&S) -> u32 + Sync + Send + Copy,
     conv: impl Fn(&S) -> T + Sync + Send + Copy,
 ) -> (HugeVec<T>, Vec<u32>) {
-    // histograms per partition
     let mut hist: Vec<Vec<u32>> = Vec::with_capacity(P);
     {
         let next = AtomicUsize::new(0);
@@ -1197,13 +1145,12 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
             hist.push(h.unwrap());
         }
     }
-    // offsets: start[p], and pos[q][p]
     let mut start = vec![0u32; n_persons + 1];
     for p in 0..n_persons {
         let mut tot = 0u32;
         for q in 0..P {
             let c = hist[q][p];
-            hist[q][p] = start[p] + tot; // becomes write position
+            hist[q][p] = start[p] + tot;
             tot += c;
         }
         start[p + 1] = start[p] + tot;

@@ -285,3 +285,190 @@ pub fn prefetch<T>(p: *const T) {
         let _ = p;
     }
 }
+
+/// A packed ID: lowercase base-36 strings of 1..=12 chars are encoded as a base-37 number (digits 1..=36),
+/// which is injective and fits in 63 bits. Anything else is stored as a `Key` in a per-thread side table and
+/// referenced as (1<<63 | aid<<32 | index). Two packed keys are equal iff their u64s are equal.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[repr(transparent)]
+pub struct PKey(pub u64);
+
+static CHAR_VAL: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = (i + 1) as u8;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < 26 {
+        t[b'a' as usize + j] = (j + 11) as u8;
+        j += 1;
+    }
+    t
+};
+const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Per-thread storage for IDs that do not pack: side table of Keys plus the arena for Keys over 15 bytes.
+pub struct Side {
+    pub keys: Vec<Key>,
+    pub arena: Vec<u8>,
+}
+impl Side {
+    pub fn new() -> Self {
+        Side { keys: Vec::new(), arena: Vec::new() }
+    }
+}
+pub type Sides = [Side];
+
+impl PKey {
+    #[inline(always)]
+    pub fn new(s: &[u8], aid: usize, side: &mut Side) -> PKey {
+        let n = s.len();
+        if n >= 1 && n <= 12 {
+            let mut v: u64 = 0;
+            let mut bad = 0u8;
+            for &c in s {
+                let t = CHAR_VAL[c as usize];
+                bad |= (t == 0) as u8;
+                v = v * 37 + t as u64;
+            }
+            if bad == 0 {
+                return PKey(v);
+            }
+        }
+        let idx = side.keys.len();
+        side.keys.push(Key::new(s, aid, &mut side.arena));
+        PKey((1u64 << 63) | ((aid as u64) << 32) | idx as u64)
+    }
+    #[inline(always)]
+    pub fn is_packed(&self) -> bool {
+        (self.0 >> 63) == 0
+    }
+    #[inline(always)]
+    fn mix(v: u64) -> u64 {
+        let mut h = v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 32;
+        h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        h ^= h >> 29;
+        h
+    }
+    /// Hash: packed keys mix the u64; fallback keys hash their bytes so equal strings from different
+    /// threads hash alike. `sides` must hold every thread's side table.
+    #[inline(always)]
+    pub fn hash(&self, sides: &Sides) -> u64 {
+        if self.is_packed() {
+            Self::mix(self.0)
+        } else {
+            let aid = ((self.0 >> 32) & 0x7FFF_FFFF) as usize;
+            let k = &sides[aid].keys[(self.0 & 0xFFFF_FFFF) as usize];
+            hash_bytes(k.bytes_from(&sides[aid].arena))
+        }
+    }
+    /// Hash while parsing, when only this thread's own side table exists.
+    #[inline(always)]
+    pub fn hash_in(&self, side: &Side) -> u64 {
+        if self.is_packed() {
+            Self::mix(self.0)
+        } else {
+            let k = &side.keys[(self.0 & 0xFFFF_FFFF) as usize];
+            hash_bytes(k.bytes_from(&side.arena))
+        }
+    }
+    #[inline(always)]
+    pub fn same(&self, other: &PKey, sides: &Sides) -> bool {
+        if self.0 == other.0 {
+            return true;
+        }
+        if self.is_packed() || other.is_packed() {
+            return false;
+        }
+        let a = self.side_key(sides);
+        let b = other.side_key(sides);
+        let arenas_a = &sides[((self.0 >> 32) & 0x7FFF_FFFF) as usize].arena;
+        let arenas_b = &sides[((other.0 >> 32) & 0x7FFF_FFFF) as usize].arena;
+        a.bytes(std::slice::from_ref(arenas_a)) == b.bytes(std::slice::from_ref(arenas_b))
+    }
+    #[inline(always)]
+    fn side_key<'a>(&self, sides: &'a Sides) -> &'a Key {
+        let aid = ((self.0 >> 32) & 0x7FFF_FFFF) as usize;
+        &sides[aid].keys[(self.0 & 0xFFFF_FFFF) as usize]
+    }
+    /// The ID's bytes. `buf` receives the decoded packed form.
+    #[inline]
+    pub fn bytes<'a>(&self, sides: &'a Sides, buf: &'a mut [u8; 12]) -> &'a [u8] {
+        if self.is_packed() {
+            let mut v = self.0;
+            let mut n = 0;
+            while v != 0 {
+                n += 1;
+                buf[12 - n] = DIGITS[(v % 37) as usize - 1];
+                v /= 37;
+            }
+            &buf[12 - n..]
+        } else {
+            let aid = ((self.0 >> 32) & 0x7FFF_FFFF) as usize;
+            let k = &sides[aid].keys[(self.0 & 0xFFFF_FFFF) as usize];
+            // Key::bytes needs the arena slice indexed by arena id == aid; sides[aid].arena is that arena
+            k.bytes_from(&sides[aid].arena)
+        }
+    }
+    #[inline]
+    pub fn cmp_bytes(&self, other: &PKey, sides: &Sides) -> std::cmp::Ordering {
+        let (mut ba, mut bb) = ([0u8; 12], [0u8; 12]);
+        self.bytes(sides, &mut ba).cmp(other.bytes(sides, &mut bb))
+    }
+}
+
+impl Key {
+    /// Bytes when the arena for this key is known directly.
+    #[inline(always)]
+    pub fn bytes_from<'a>(&'a self, arena: &'a Vec<u8>) -> &'a [u8] {
+        let tag = (self.0 >> 120) as u8;
+        if tag != 0xFF {
+            unsafe { std::slice::from_raw_parts(self as *const Key as *const u8, tag as usize) }
+        } else {
+            let off = self.0 as u32 as usize;
+            let len = ((self.0 >> 48) & 0xFFFF_FFFF_FFFF) as usize;
+            &arena[off..off + len]
+        }
+    }
+}
+
+#[cfg(test)]
+mod pkey_tests {
+    use super::*;
+    #[test]
+    fn pack_roundtrip() {
+        let mut side = Side::new();
+        let ids: Vec<&[u8]> = vec![
+            b"u1", b"u01", b"u10", b"e42huhoug", b"zzzzzzzzzzzz", b"0", b"000000000000", b"a", b"", b" u1", b"u1 ", b"U1",
+            b"user_id_b", b"A\tB", b"uabcdefghijkl", b"uabcdefghijklm", b"this-is-a-long-user-id-0001", b"c_1",
+        ];
+        let keys: Vec<PKey> = ids.iter().map(|s| PKey::new(s, 0, &mut side)).collect();
+        let sides = vec![side];
+        for (i, a) in keys.iter().enumerate() {
+            let mut buf = [0u8; 12];
+            assert_eq!(a.bytes(&sides, &mut buf), ids[i], "{:?}", std::str::from_utf8(ids[i]));
+            for (j, b) in keys.iter().enumerate() {
+                assert_eq!(a.same(b, &sides), ids[i] == ids[j], "{:?} vs {:?}", std::str::from_utf8(ids[i]), std::str::from_utf8(ids[j]));
+                assert_eq!(a.cmp_bytes(b, &sides), ids[i].cmp(ids[j]));
+            }
+        }
+        // equal strings in different side tables hash alike
+        let mut s0 = Side::new();
+        let mut s1 = Side::new();
+        let k0 = PKey::new(b" u1", 0, &mut s0);
+        let _ = PKey::new(b"zzz_pad", 1, &mut s1);
+        let k1 = PKey::new(b" u1", 1, &mut s1);
+        let two = vec![s0, s1];
+        assert_eq!(k0.hash(&two), k1.hash(&two));
+        assert!(k0.same(&k1, &two));
+        assert_eq!(k0.hash_in(&two[0]), k0.hash(&two));
+        assert!(PKey::new(b"e42huhoug", 0, &mut Side::new()).is_packed());
+        assert!(!PKey::new(b"user_id_b", 0, &mut Side::new()).is_packed());
+        assert!(!PKey::new(b"", 0, &mut Side::new()).is_packed());
+        assert!(!PKey::new(b"abcdefghijklm", 0, &mut Side::new()).is_packed());
+        assert!(PKey::new(b"abcdefghijkl", 0, &mut Side::new()).is_packed());
+    }
+}
