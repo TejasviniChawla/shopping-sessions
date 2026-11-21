@@ -1039,14 +1039,17 @@ fn main() {
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let next = AtomicUsize::new(0);
     const BLOCK: usize = 512;
-    let walkers: Vec<Walker> = std::thread::scope(|s| {
+    let user_dir = outdir.join("user_daily");
+    std::fs::create_dir_all(&user_dir).expect("mkdir user_daily");
+    let results: Vec<(Vec<[i64; 4]>, usize)> = std::thread::scope(|s| {
         let mut hs = Vec::new();
         let evp = Shared(ev_final.as_ptr() as *mut EvFinal);
         let clp = Shared(cl_final.as_ptr() as *mut ClFinal);
-        for _ in 0..nthreads {
+        for t in 0..nthreads {
             let next = &next;
             let ctx = &ctx;
             let (ev_start, cl_start) = (&ev_start, &cl_start);
+            let (person_name, user_dir) = (&person_name, &user_dir);
             hs.push(s.spawn(move || {
                 let mut w = Walker::new(ctx, day0, ndays);
                 loop {
@@ -1067,35 +1070,39 @@ fn main() {
                         w.walk(p as u32, ev, cl);
                     }
                 }
-                w
+                // write this thread's user_daily rows as its own parquet part (thread 0 always writes a file)
+                let n_rows = w.rows.len();
+                if n_rows > 0 || t == 0 {
+                    let mut uc = out::UserDailyCols::new(n_rows);
+                    for r in &w.rows {
+                        let name = person_name[r.person as usize].bytes(files);
+                        uc.user_id.append_value(unsafe { std::str::from_utf8_unchecked(name) });
+                        uc.day.push(r.day);
+                        uc.sessions.push(r.sessions as i64);
+                        uc.events.push(r.events as i64);
+                        uc.revenue.push(r.revenue);
+                        if r.top_cat == u16::MAX {
+                            uc.top_category.append_null();
+                        } else {
+                            uc.top_category
+                                .append_value(unsafe { std::str::from_utf8_unchecked(&ctx.cat_names[r.top_cat as usize]) });
+                        }
+                    }
+                    out::write_user_daily(&user_dir.join(format!("part-{}.parquet", t)), uc).expect("write user_daily");
+                }
+                (w.camp, n_rows)
             }));
         }
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    log(&t0, "sessions+attribution done");
+    log(&t0, "sessions+attribution+user_daily done");
 
-    // Output
-    let n_rows: usize = walkers.iter().map(|w| w.rows.len()).sum();
-    let mut uc = out::UserDailyCols::new(n_rows);
-    for w in &walkers {
-        for r in &w.rows {
-            let name = person_name[r.person as usize].bytes(files);
-            uc.user_id.append_value(unsafe { std::str::from_utf8_unchecked(name) });
-            uc.day.push(r.day);
-            uc.sessions.push(r.sessions as i64);
-            uc.events.push(r.events as i64);
-            uc.revenue.push(r.revenue);
-            if r.top_cat == u16::MAX {
-                uc.top_category.append_null();
-            } else {
-                uc.top_category.append_value(unsafe { std::str::from_utf8_unchecked(&ctx.cat_names[r.top_cat as usize]) });
-            }
-        }
-    }
+    // campaign_daily
+    let n_rows: usize = results.iter().map(|r| r.1).sum();
     let ncells = (ctx.ncamp as usize + 1) * ndays;
     let mut camp = vec![[0i64; 4]; ncells];
-    for w in &walkers {
-        for (i, c) in w.camp.iter().enumerate() {
+    for (wc, _) in &results {
+        for (i, c) in wc.iter().enumerate() {
             for k in 0..4 {
                 camp[i][k] += c[k];
             }
@@ -1117,7 +1124,6 @@ fn main() {
             cc.assisted_sessions.push(c[3]);
         }
     }
-    out::write_user_daily(&outdir.join("user_daily"), uc).expect("write user_daily");
     out::write_campaign_daily(&outdir.join("campaign_daily"), cc).expect("write campaign_daily");
     log(&t0, &format!("wrote {} user rows", n_rows));
 }

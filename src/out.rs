@@ -40,8 +40,7 @@ impl UserDailyCols {
     }
 }
 
-pub fn write_user_daily(dir: &Path, mut c: UserDailyCols) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+pub fn write_user_daily(path: &Path, mut c: UserDailyCols) -> std::io::Result<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
@@ -59,8 +58,14 @@ pub fn write_user_daily(dir: &Path, mut c: UserDailyCols) -> std::io::Result<()>
         Arc::new(c.top_category.finish()),
     ];
     let batch = RecordBatch::try_new(schema.clone(), cols).expect("batch");
-    let file = File::create(dir.join("part-0.parquet"))?;
-    let mut w = ArrowWriter::try_new(file, schema, Some(props())).expect("writer");
+    let file = File::create(path)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(1 << 20))
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+        .set_column_dictionary_enabled("user_id".into(), false)
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).expect("writer");
     w.write(&batch).expect("write");
     w.close().expect("close");
     Ok(())
