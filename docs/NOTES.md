@@ -132,3 +132,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~10:30 ET: PGO A/B vs plain 4a83518 on one runner: 0.806-0.813 vs 0.839-0.861 (-5%). 3M vs 1M training: identical.
   Recommended: 2bf102e (or 1627d27, equivalent). Plateau of this architecture on Zen4-4vCPU-10M ~0.80 s in-container.
   Dropped ideas: stamp-value cache (shuffled input, 1.2M distinct seconds -> no locality), 28-byte raw records (~1%).
+- 2026-11-22 ~12:00 ET: SURVEY of fast public entries (Xero 0.90, Eagle Eye 0.94, Teti 1.01): 3 materializations, person resolved
+  at dedup time via flat prefetched link-id map + negative filter (no intern phase), u64 order-preserving keys, mmap input
+  (scorer /data reportedly tmpfs), hand-rolled uncompressed parquet, _exit. Branch v3 = restructure to that shape.
