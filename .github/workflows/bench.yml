@@ -25,7 +25,9 @@ jobs:
       - name: CPU info
         run: lscpu | head -20; nproc; free -g; cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Build image
-        run: docker build -t shopsess:ci . 2>&1 | grep -E "PGO|error|warning: profile" | head -20; docker image ls shopsess:ci
+        run: |
+          docker build -t shopsess:ci . 2>&1 | grep -E "PGO|error" | head -20
+          docker image ls shopsess:ci
       - name: Build comparison image
         if: ${{ github.event.inputs.compare != '' }}
         run: |
