@@ -116,3 +116,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~05:30 ET: x86 isolated bench (Zen3, ns/line): scan 20 | split 19 | ts 10 | ingest 5 | keys 8 | type/hash 8 | push 15.
   Block-based scanner prototype is NOT faster than the per-line 128-byte masks (22.9 vs 20.2 ns/line realistic): dropped.
   Batch: intern-table prefetch; person histogram derived from per-uid counts gathered during intern (no record pass).
+- 2026-11-22 ~06:00 ET: SCORER 342c221 = 1.88 s (vs 574a577 1.62) despite same-runner CI -5%: attributed to the organizers'
+  stated +-20% machine variance (queue wait 524 ms). Practice board is noisy; the final retimes. Choose by same-runner A/B.
+  Dedup candidate ordering experiment: linear probing with slot-sorted inserts is quadratic (pass3 15 s) -> reverted.
+  u64-halves splitter: -1 ns/line only (not integrated). Container overhead of our image on CI: 0.10 s.
