@@ -68,12 +68,12 @@ impl Thrift {
     }
 }
 
-fn page_header(num_values: usize, size: usize) -> Vec<u8> {
+fn page_header(num_values: usize, uncompressed: usize, compressed: usize) -> Vec<u8> {
     let mut t = Thrift(Vec::with_capacity(32));
     let mut l = 0i16;
     t.i32f(&mut l, 1, 0); // DATA_PAGE
-    t.i32f(&mut l, 2, size as i32);
-    t.i32f(&mut l, 3, size as i32);
+    t.i32f(&mut l, 2, uncompressed as i32);
+    t.i32f(&mut l, 3, compressed as i32);
     t.struct_begin(&mut l, 5);
     {
         let mut l2 = 0i16;
@@ -122,10 +122,16 @@ struct ChunkMeta {
     name: String,
     num_values: i64,
     bytes: i64,
+    raw_bytes: i64,
     data_page_offset: i64,
 }
 
 pub fn write(path: &std::path::Path, cols: &[Col], nrows: usize) -> std::io::Result<()> {
+    write_opts(path, cols, nrows, true)
+}
+
+pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bool) -> std::io::Result<()> {
+    let mut enc = snap::raw::Encoder::new();
     let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
     let mut pos: u64 = 0;
     f.write_all(b"PAR1")?;
@@ -134,6 +140,7 @@ pub fn write(path: &std::path::Path, cols: &[Col], nrows: usize) -> std::io::Res
     for c in cols {
         let start = pos;
         let mut total = 0u64;
+        let mut raw_total = 0u64;
         let (ty, name) = match c {
             Col::I64(n, _) => (2, *n),
             Col::Date(n, _) => (1, *n),
@@ -167,17 +174,24 @@ pub fn write(path: &std::path::Path, cols: &[Col], nrows: usize) -> std::io::Res
                     }
                 }
             }
-            let hdr = page_header(end - row, page.len());
+            let uncompressed_len = page.len();
+            let (hdr, body) = if snappy {
+                let c = enc.compress_vec(&page).expect("snappy");
+                (page_header(end - row, page.len(), c.len()), c)
+            } else {
+                (page_header(end - row, page.len(), page.len()), page)
+            };
             f.write_all(&hdr)?;
-            f.write_all(&page)?;
-            total += (hdr.len() + page.len()) as u64;
+            f.write_all(&body)?;
+            total += (hdr.len() + body.len()) as u64;
+            raw_total += (hdr.len() + uncompressed_len) as u64;
             row = end;
             if nrows == 0 {
                 break;
             }
         }
         pos += total;
-        metas.push(ChunkMeta { ty, name: name.to_string(), num_values: nrows as i64, bytes: total as i64, data_page_offset: start as i64 });
+        metas.push(ChunkMeta { ty, name: name.to_string(), num_values: nrows as i64, bytes: total as i64, raw_bytes: raw_total as i64, data_page_offset: start as i64 });
     }
     // FileMetaData
     let mut t = Thrift(Vec::with_capacity(512));
@@ -233,9 +247,9 @@ pub fn write(path: &std::path::Path, cols: &[Col], nrows: usize) -> std::io::Res
                 t.list_begin(&mut l4, 3, 1, 8);
                 t.varint(m.name.len() as u64);
                 t.0.extend_from_slice(m.name.as_bytes());
-                t.i32f(&mut l4, 4, 0); // UNCOMPRESSED
+                t.i32f(&mut l4, 4, if snappy { 1 } else { 0 }); // SNAPPY / UNCOMPRESSED
                 t.i64f(&mut l4, 5, m.num_values);
-                t.i64f(&mut l4, 6, m.bytes);
+                t.i64f(&mut l4, 6, m.raw_bytes);
                 t.i64f(&mut l4, 7, m.bytes);
                 t.i64f(&mut l4, 9, m.data_page_offset);
                 t.stop();
