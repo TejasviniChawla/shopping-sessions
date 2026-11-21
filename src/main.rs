@@ -473,6 +473,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, sc: &mut 
     }
     let cap = (cands.len() * 2).max(64).next_power_of_two();
     let mask = cap - 1;
+    // slot = top bits of the hash, so the slot order matches the candidate order established above
+    let shift = 64 - cap.trailing_zeros();
     let mut slots = std::mem::take(&mut sc.slots);
     slots.clear();
     slots.resize(cap, (u32::MAX, PKey(0)));
@@ -482,17 +484,17 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, sc: &mut 
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     let nc = cands.len();
     for k in 0..nc.min(D) {
-        prefetch(unsafe { slots.as_ptr().add(((get(cands[k]).id.hash(sides) >> 32) as usize) & mask) });
+        prefetch(unsafe { slots.as_ptr().add((get(cands[k]).id.hash(sides) >> shift) as usize) });
     }
     for k in 0..nc {
         if k + D < nc {
-            prefetch(unsafe { slots.as_ptr().add(((get(cands[k + D]).id.hash(sides) >> 32) as usize) & mask) });
+            prefetch(unsafe { slots.as_ptr().add((get(cands[k + D]).id.hash(sides) >> shift) as usize) });
         }
         let packed = cands[k];
         let r = get(packed);
         let h = r.id.hash(sides);
         let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
-        let mut s = ((h >> 32) as usize) & mask;
+        let mut s = (h >> shift) as usize;
         loop {
             let (cur, ck) = slots[s];
             if cur == u32::MAX {
