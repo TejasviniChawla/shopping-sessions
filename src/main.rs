@@ -273,7 +273,7 @@ fn parse_parallel<T: Copy + Default + Send, F>(
     f: F,
 ) -> (Vec<Vec<HugeVec<T>>>, Vec<Side>)
 where
-    F: Fn(&Ctx, usize, &mut Side, &[u8], Option<(u128, u128)>) -> Option<(usize, T)> + Sync,
+    F: Fn(&Ctx, usize, &mut Side, &[u8], Option<(u128, u128)>, &mut Scatter<T, P>) -> Option<(usize, T)> + Sync,
 {
     let next = AtomicUsize::new(0);
     let total_bytes: u64 = units.iter().map(|u| u.end - u.start).sum();
@@ -299,7 +299,7 @@ where
                     let data = buf.data();
                     let mut sc = Scanner::new(data, lo, hi);
                     while let Some((line, masks)) = sc.next() {
-                        if let Some((p, rec)) = f(ctx, aid, &mut side, line, masks) {
+                        if let Some((p, rec)) = f(ctx, aid, &mut side, line, masks, &mut out) {
                             out.push(p, rec);
                         }
                     }
@@ -600,15 +600,6 @@ fn intern_partition(
     for t in links {
         for l in t[q].iter() {
             table.insert(l.a, sides);
-        }
-    }
-    for t in links {
-        for lp in t.iter() {
-            for l in lp.iter() {
-                if part(l.b.hash(sides)) == q {
-                    table.insert(l.b, sides);
-                }
-            }
         }
     }
     let mut events: HugeVec<EvMid> = HugeVec::with_capacity(nev);
@@ -968,21 +959,26 @@ fn run() {
     }
 
     // Phase 1: parse
-    let (ev_raw, sd_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, side, line, masks| {
+    let (ev_raw, sd_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, side, line, masks, _| {
         parse_event_line(c, aid, side, line, masks).map(|r| (part(r.id.hash_in(side)), r))
     });
     log(&t0, "events parsed");
-    let (cl_raw, sd_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, side, line, masks| {
+    let (cl_raw, sd_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, side, line, masks, _| {
         parse_click_line(c, aid, side, line, masks).map(|r| (part(r.id.hash_in(side)), r))
     });
-    let (links, sd_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, side, line, masks| {
+    let (links, sd_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, side, line, masks, extra| {
         let mut f = [&b""[..]; 2];
         if !split_scanned(line, masks, &mut f) || f[0].is_empty() || f[1].is_empty() {
             return None;
         }
         let a = PKey::new(f[0], aid, side);
         let b = PKey::new(f[1], aid, side);
-        Some((part(a.hash_in(side)), LinkRaw { a, b }))
+        // the mirrored copy goes to b's partition so every partition sees all of its own IDs locally
+        let (pa, pb) = (part(a.hash_in(side)), part(b.hash_in(side)));
+        if pa != pb {
+            extra.push(pb, LinkRaw { a: b, b: a });
+        }
+        Some((pa, LinkRaw { a, b }))
     });
     log(&t0, "clicks+links parsed");
     let mut sides_v: Vec<Side> = Vec::with_capacity(3 * nthreads);

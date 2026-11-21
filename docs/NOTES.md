@@ -81,3 +81,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 06:00: GNR CI single-thread per 10.8M lines: lines 0.18 | split +0.19 | timestamps +0.27 | keys +0.11 | push ~+0.08.
   Added per-thread date cache (civil19_cached) and sketch-based dedup (2-bit counters, 16 slots/record; exact table only for
   candidates). Prefetch D=16. Intern table est shrunk. All checks pass.
+- 2026-11-21 07:30: SCORER RESULT for commit 7526431: 1.79 s (leader 1.0). CI Zen4-4vCPU-10M in-container ~1.08 s => scorer ~1.4 + 0.35 docker.
+  Since: pass-2 prefetch, packed events (16/12/8 B), links mirrored into both partitions (removes 32x scan of all links in intern).

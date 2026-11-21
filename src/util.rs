@@ -190,7 +190,7 @@ unsafe impl<T: Sync> Sync for HugeVec<T> {}
 
 const HUGE: usize = 2 << 20;
 /// Below this size an allocation uses normal pages and page-size rounding (P*P small vectors must not each take 2 MB).
-const HUGE_MIN: usize = 8 << 20;
+const HUGE_MIN: usize = 2 << 20;
 
 fn map_bytes(bytes: usize) -> *mut u8 {
     unsafe {
