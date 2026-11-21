@@ -116,6 +116,17 @@ pub fn parse_f1(s: &[u8]) -> Option<i64> {
     civil19(s)
 }
 
+/// Lemire's SWAR parse of 8 ASCII digits (caller validated them).
+#[inline(always)]
+fn parse8(v: u64) -> u64 {
+    let v = v.wrapping_sub(0x3030_3030_3030_3030);
+    let v = (v * 10) + (v >> 8);
+    let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(0x000F_4240_0000_0064)
+        + ((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(0x0000_2710_0000_0001))
+        >> 32;
+    v & 0xFFFF_FFFF
+}
+
 /// Any of F1/F2/F3. Returns epoch ms. None = bad timestamp. Range is not checked here.
 #[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
@@ -124,6 +135,15 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
         return None;
     }
     let first = s[0];
+    if n == 13 && first.is_ascii_digit() {
+        // common F3 case: 13 digits = two overlapping 8-digit words
+        let w0 = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+        let w1 = u64::from_le_bytes([s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]]);
+        if is_digits8(w0) && is_digits8(w1) {
+            return Some((parse8(w0) * 100_000 + parse8(w1) % 100_000) as i64);
+        }
+        return None;
+    }
     if first.is_ascii_digit() && (n < 5 || s[4] != b'-') {
         // F3: digits only. Leading zeros allowed. Overflow => not representable => treat as bad (out of window).
         let mut i = 0;
@@ -235,6 +255,13 @@ mod tests {
         assert!(parse_ts(b"2026-10-03T23:58:10-00:00").is_some());
         assert!(parse_ts(b"2026-10-03T23:58:10+23:59").is_some());
         assert_eq!(parse_ts(b"86400000"), Some(86_400_000));
+        assert_eq!(parse_ts(b"1791071890123"), Some(1_791_071_890_123));
+        assert_eq!(parse_ts(b"0000000000001"), Some(1));
+        assert_eq!(parse_ts(b"9999999999999"), Some(9_999_999_999_999));
+        assert!(parse_ts(b"179107189012x").is_none());
+        assert!(parse_ts(b"1791071890 23").is_none());
+        assert!(parse_ts(b"\xd9\xa2\xd9\xa5\xd9\xa0000000").is_none());
+        assert!(parse_ts(b"1791071890.00").is_none());
         assert!(parse_ts(b"123456789012345678901").is_none());
         assert!(parse_ts(b"").is_none());
         assert!(parse_ts(b"2026-10-03T23:58:10Z\r").is_none());
