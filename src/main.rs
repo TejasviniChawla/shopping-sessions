@@ -11,7 +11,7 @@ use io::{Buffer, Unit};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use ts::{parse_f1, parse_ts, DAY};
+use ts::{parse_f1, parse_f1_cached, parse_ts, parse_ts_cached, DAY};
 use util::{prefetch, HugeVec, PKey, Scatter, Side, Sides, SmallTable};
 
 const LOG_P: u32 = 5;
@@ -200,12 +200,12 @@ fn parse_event_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: 
     if !split_scanned(line, masks, &mut f) || f[0].is_empty() {
         return None;
     }
-    let ingest = match parse_f1(f[3]) {
+    let ingest = match parse_f1_cached(f[3], &mut side.dates) {
         Some(t) => ((t - ctx.ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         None => i32::MAX,
     };
     let mut flags = 0u8;
-    let ts = match parse_ts(f[2]) {
+    let ts = match parse_ts_cached(f[2], &mut side.dates) {
         Some(t) if t >= ctx.ws && t < ctx.we => {
             flags |= 1;
             (t - ctx.ws) as u32
@@ -249,7 +249,7 @@ fn parse_click_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: 
     }
     let mut flags = 0u8;
     let lo = ctx.ws - REACH;
-    let ts = match parse_ts(f[3]) {
+    let ts = match parse_ts_cached(f[3], &mut side.dates) {
         Some(t) if t >= lo && t < ctx.we => {
             flags |= 1;
             (t - lo) as u32
@@ -323,37 +323,86 @@ where
 
 // ---------- dedup ----------
 
+/// 2-bit saturating counters, 16 slots per record: a record whose slot count is < 2 has a unique key in
+/// this partition and skips the exact table. Fits in L2 for typical partition sizes.
+struct Sketch {
+    words: Vec<u64>,
+    mask: usize,
+}
+impl Sketch {
+    fn new(total: usize) -> Self {
+        let slots = (total * 16).max(1024).next_power_of_two();
+        Sketch { words: vec![0u64; slots / 32], mask: slots - 1 }
+    }
+    #[inline(always)]
+    fn bump(&mut self, h: u64) {
+        let slot = (h as usize) & self.mask;
+        let w = &mut self.words[slot >> 5];
+        let sh = (slot & 31) * 2;
+        let v = (*w >> sh) & 3;
+        *w += ((v < 2) as u64) << sh;
+    }
+    #[inline(always)]
+    fn count(&self, h: u64) -> u64 {
+        let slot = (h as usize) & self.mask;
+        (self.words[slot >> 5] >> ((slot & 31) * 2)) & 3
+    }
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        prefetch(unsafe { self.words.as_ptr().add(((h as usize) & self.mask) >> 5) });
+    }
+}
+
+#[inline(always)]
+fn event_ok(r: &EvRaw) -> bool {
+    let etype = r.flags >> 4;
+    (r.flags & 7) == 7 && etype < 3 && (etype != 2 || (r.flags & 8) != 0) && (r.ingest as i64) * 1000 - (r.ts as i64) <= LATE
+}
+
 /// Per partition p: dedup event copies by event_id keeping min ingest, validate, scatter by user hash.
 fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<HugeVec<EvValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
-    let cap = (total * 2).max(16).next_power_of_two();
-    let mask = cap - 1;
-    // slot -> (packed record index, key); key stored so probes never touch records
-    let mut slots: HugeVec<(u32, PKey)> = HugeVec::with_len_uninit(cap);
-    for s in slots.iter_mut() {
-        *s = (u32::MAX, PKey(0));
+    const D: usize = 16;
+    // pass 1: count sketch
+    let mut sk = Sketch::new(total);
+    for tv in raws.iter() {
+        let recs = &tv[p][..];
+        let n = recs.len();
+        for i in 0..n.min(D) {
+            sk.prefetch(recs[i].id.hash(sides));
+        }
+        for i in 0..n {
+            if i + D < n {
+                sk.prefetch(recs[i + D].id.hash(sides));
+            }
+            sk.bump(recs[i].id.hash(sides));
+        }
     }
-    let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
+    // pass 2: unique keys are winners; candidates go through an exact table (min ingest wins)
+    let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
+    let mut cands: Vec<u32> = Vec::with_capacity(total / 8 + 64);
+    let cap = (total / 4).max(64).next_power_of_two();
+    let mask = cap - 1;
+    let mut slots: Vec<(u32, PKey)> = vec![(u32::MAX, PKey(0)); cap];
     let mut off = vec![0usize; raws.len() + 1];
     for t in 0..raws.len() {
         off[t + 1] = off[t] + raws[t][p].len();
     }
     let mut win = vec![0u64; (total + 63) / 64 + 1];
-    const D: usize = 8;
+    let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
-        let n = recs.len();
-        for i in 0..n.min(D) {
-            prefetch(unsafe { slots.as_ptr().add((recs[i].id.hash(sides) as usize) & mask) });
-        }
-        for i in 0..n {
-            let r = &recs[i];
-            if i + D < n {
-                prefetch(unsafe { slots.as_ptr().add((recs[i + D].id.hash(sides) as usize) & mask) });
-            }
+        for (i, r) in recs.iter().enumerate() {
             let h = r.id.hash(sides);
+            if sk.count(h) < 2 {
+                if event_ok(r) {
+                    out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype: r.flags >> 4 });
+                }
+                continue;
+            }
             let packed = ((t as u32) << 27) | (i as u32);
             let dense = off[t] + i;
+            cands.push(packed);
             let mut s = (h as usize) & mask;
             loop {
                 let (cur, ck) = slots[s];
@@ -376,24 +425,17 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
             }
         }
     }
-    drop(slots);
-    let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
-    for (t, tv) in raws.iter().enumerate() {
-        let recs = &tv[p][..];
-        for (i, r) in recs.iter().enumerate() {
-            let dense = off[t] + i;
-            if (win[dense >> 6] >> (dense & 63)) & 1 == 0 {
-                continue;
-            }
-            let etype = r.flags >> 4;
-            let ok = (r.flags & 7) == 7
-                && etype < 3
-                && (etype != 2 || (r.flags & 8) != 0)
-                && (r.ingest as i64) * 1000 - (r.ts as i64) <= LATE;
-            if !ok {
-                continue;
-            }
-            out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype });
+    // pass 3: candidate winners
+    for &packed in &cands {
+        let t = (packed >> 27) as usize;
+        let i = (packed & 0x7FF_FFFF) as usize;
+        let dense = off[t] + i;
+        if (win[dense >> 6] >> (dense & 63)) & 1 == 0 {
+            continue;
+        }
+        let r = &raws[t][p][i];
+        if event_ok(r) {
+            out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype: r.flags >> 4 });
         }
     }
     out.finish()
@@ -401,37 +443,44 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
 
 fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
-    let cap = (total * 2).max(16).next_power_of_two();
-    let mask = cap - 1;
-    let mut slots: HugeVec<(u32, PKey)> = HugeVec::with_len_uninit(cap);
-    for s in slots.iter_mut() {
-        *s = (u32::MAX, PKey(0));
-    }
-    let mut out: Scatter<ClValid, P> = Scatter::new(total / P + 1024);
-    const D: usize = 8;
+    const D: usize = 16;
+    let mut sk = Sketch::new(total);
     for tv in raws.iter() {
         let recs = &tv[p][..];
         let n = recs.len();
         for i in 0..n.min(D) {
-            prefetch(unsafe { slots.as_ptr().add((recs[i].id.hash(sides) as usize) & mask) });
+            sk.prefetch(recs[i].id.hash(sides));
         }
         for i in 0..n {
-            let r = &recs[i];
             if i + D < n {
-                prefetch(unsafe { slots.as_ptr().add((recs[i + D].id.hash(sides) as usize) & mask) });
+                sk.prefetch(recs[i + D].id.hash(sides));
             }
+            sk.bump(recs[i].id.hash(sides));
+        }
+    }
+    let cap = (total / 4).max(64).next_power_of_two();
+    let mask = cap - 1;
+    let mut slots: Vec<PKey> = vec![PKey(0); cap];
+    let mut used: Vec<bool> = vec![false; cap];
+    let mut out: Scatter<ClValid, P> = Scatter::new(total / P + 1024);
+    for tv in raws.iter() {
+        for r in tv[p].iter() {
             let h = r.id.hash(sides);
-            let mut s = (h as usize) & mask;
-            let fresh = loop {
-                let (cur, ck) = slots[s];
-                if cur == u32::MAX {
-                    slots[s] = (0, r.id);
-                    break true;
+            let fresh = if sk.count(h) < 2 {
+                true
+            } else {
+                let mut s = (h as usize) & mask;
+                loop {
+                    if !used[s] {
+                        used[s] = true;
+                        slots[s] = r.id;
+                        break true;
+                    }
+                    if slots[s].same(&r.id, sides) {
+                        break false;
+                    }
+                    s = (s + 1) & mask;
                 }
-                if ck.same(&r.id, sides) {
-                    break false;
-                }
-                s = (s + 1) & mask;
             };
             if fresh && (r.flags & 7) == 7 {
                 out.push(part(r.user.hash(sides)), ClValid { id: r.id, user: r.user, ts: r.ts, camp: r.camp });
@@ -519,7 +568,8 @@ fn intern_partition(
     let nev: usize = evv.iter().map(|v| v[q].len()).sum();
     let ncl: usize = clv.iter().map(|v| v[q].len()).sum();
     let nl: usize = links.iter().map(|t| t[q].len()).sum();
-    let mut table = Intern::new(nl * 2 + nev / 8 + ncl / 8 + 64);
+    // ~1 ID per 13 events in the generator's data; the table grows if a dataset has more
+    let mut table = Intern::new(nl + nev / 12 + ncl / 12 + 64);
     for t in links {
         for l in t[q].iter() {
             table.insert(l.a, sides);

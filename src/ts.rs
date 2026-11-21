@@ -80,6 +80,96 @@ fn civil19(s: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, m, dd) * DAY + hh * HOUR + mi * MINUTE + ss * SECOND)
 }
 
+/// Per-thread cache of validated dates: the window holds only ~21 distinct dates, so the calendar
+/// validation and day arithmetic are almost always skipped.
+#[derive(Clone, Copy, Default)]
+pub struct DateEntry {
+    key: u64, // "YYYY-MM-"
+    day2: u16, // "DD"
+    valid: bool,
+    days: i32, // days since epoch
+}
+pub type DateCache = [DateEntry; 32];
+
+/// `civil19` with a date cache. `s.len() >= 19`.
+#[inline(always)]
+pub fn civil19_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
+    let w0 = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+    let d2 = u16::from_le_bytes([s[8], s[9]]);
+    let idx = (((s[8] & 0xF) as usize) * 10 + ((s[9] & 0xF) as usize)) & 31;
+    let e = cache[idx];
+    let days = if e.valid && e.key == w0 && e.day2 == d2 {
+        e.days as i64
+    } else {
+        // slow path: full validation of the date part via civil19 on a zeroed time
+        let mut tmp = [0u8; 19];
+        tmp[..10].copy_from_slice(&s[..10]);
+        tmp[10..].copy_from_slice(b"T00:00:00");
+        let ms = civil19(&tmp)?;
+        let d = ms / DAY;
+        cache[idx] = DateEntry { key: w0, day2: d2, valid: true, days: d as i32 };
+        d
+    };
+    // time part: s[10] == 'T', then "HH:MM:SS" at 11..19
+    if s[10] != b'T' {
+        return None;
+    }
+    let w = u64::from_le_bytes([s[11], s[12], s[13], s[14], s[15], s[16], s[17], s[18]]);
+    const SEP: u64 = 0x0000_FF00_00FF_0000; // bytes 2 and 5
+    const PAT: u64 = ((b':' as u64) << 16) | ((b':' as u64) << 40);
+    const ZERO: u64 = ((b'0' as u64) << 16) | ((b'0' as u64) << 40);
+    if (w & SEP) != PAT || !is_digits8((w & !SEP) | ZERO) {
+        return None;
+    }
+    let b = |i: u32| -> i64 { ((w >> (8 * i)) & 0xFF) as i64 - 48 };
+    let hh = b(0) * 10 + b(1);
+    let mi = b(3) * 10 + b(4);
+    let ss = b(6) * 10 + b(7);
+    if hh > 23 || mi > 59 || ss > 59 {
+        return None;
+    }
+    Some(days * DAY + hh * HOUR + mi * MINUTE + ss * SECOND)
+}
+
+/// Strict F1 with a date cache.
+#[inline(always)]
+pub fn parse_f1_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
+    if s.len() != 20 || s[19] != b'Z' {
+        return None;
+    }
+    civil19_cached(s, cache)
+}
+
+/// Any of F1/F2/F3 with a date cache for the civil forms.
+#[inline(always)]
+pub fn parse_ts_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
+    let n = s.len();
+    if n == 20 {
+        if s[19] != b'Z' {
+            return None;
+        }
+        return civil19_cached(s, cache);
+    }
+    if n == 25 && s[4] == b'-' {
+        let sign = match s[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if s[22] != b':' {
+            return None;
+        }
+        let oh = two(s, 20)?;
+        let om = two(s, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let base = civil19_cached(s, cache)?;
+        return Some(base - sign * (oh * HOUR + om * MINUTE));
+    }
+    parse_ts(s)
+}
+
 /// Scalar reference for tests.
 #[allow(dead_code)]
 fn civil19_scalar(s: &[u8]) -> Option<i64> {
@@ -227,6 +317,27 @@ mod tests {
                     assert_eq!(civil19(t.as_bytes()), civil19_scalar(t.as_bytes()), "{}", t);
                 }
             }
+        }
+    }
+    #[test]
+    fn cached_matches_uncached() {
+        let mut cache: DateCache = [DateEntry::default(); 32];
+        let mut x: u64 = 0xdead_beef_1234_5678;
+        let alphabet = b"0123456789-T:Zz. +";
+        let bases: [&[u8]; 4] = [b"2027-02-28T23:59:59Z", b"2028-02-29T00:00:00Z", b"2026-10-03T19:58:10-04:00", b"1791071890000"];
+        for i in 0..300000 {
+            let base = bases[i % 4];
+            let mut s = base.to_vec();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 3) as usize;
+            for k in 0..n {
+                let pos = ((x >> (8 * k + 3)) % s.len() as u64) as usize;
+                s[pos] = alphabet[((x >> (8 * k + 9)) % alphabet.len() as u64) as usize];
+            }
+            assert_eq!(parse_ts_cached(&s, &mut cache), parse_ts(&s), "{:?}", std::str::from_utf8(&s));
+            assert_eq!(parse_f1_cached(&s, &mut cache), parse_f1(&s), "{:?}", std::str::from_utf8(&s));
         }
     }
     #[test]

@@ -78,3 +78,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   THP page = 8 GB+. Fix: huge pages only for >= 8 MB allocations; P=32.
 - 2026-11-21 05:00: CI Ice Lake single-thread: lines 0.21 | +split 0.26 | +parse 0.41 | +push 0.41 s per 10.8M lines.
   Added Scatter (16-record L1 staging, 512 B bursts) for parse and dedup outputs. Mac 10M best 0.81 s.
+- 2026-11-21 06:00: GNR CI single-thread per 10.8M lines: lines 0.18 | split +0.19 | timestamps +0.27 | keys +0.11 | push ~+0.08.
+  Added per-thread date cache (civil19_cached) and sketch-based dedup (2-bit counters, 16 slots/record; exact table only for
+  candidates). Prefetch D=16. Intern table est shrunk. All checks pass.

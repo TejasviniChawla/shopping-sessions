@@ -366,10 +366,11 @@ const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 pub struct Side {
     pub keys: Vec<Key>,
     pub arena: Vec<u8>,
+    pub dates: crate::ts::DateCache,
 }
 impl Side {
     pub fn new() -> Self {
-        Side { keys: Vec::new(), arena: Vec::new() }
+        Side { keys: Vec::new(), arena: Vec::new(), dates: [Default::default(); 32] }
     }
 }
 pub type Sides = [Side];
