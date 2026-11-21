@@ -146,7 +146,7 @@ impl Buffer {
                     std::ptr::null_mut(),
                     len,
                     libc::PROT_READ,
-                    libc::MAP_PRIVATE | populate_flag(),
+                    libc::MAP_PRIVATE | if std::env::var_os("MAP_NOPOPULATE").is_some() { 0 } else { populate_flag() },
                     file.as_raw_fd(),
                     mstart as i64,
                 )

@@ -25,7 +25,7 @@ jobs:
       - name: CPU info
         run: lscpu | head -20; nproc; free -g; cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Build image
-        run: docker build -t shopsess:ci .
+        run: docker build -t shopsess:ci . 2>&1 | grep -E "PGO|error|warning: profile" | head -20; docker image ls shopsess:ci
       - name: Build comparison image
         if: ${{ github.event.inputs.compare != '' }}
         run: |
@@ -79,6 +79,11 @@ jobs:
             docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
               -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 -e $v=1 shopsess:ci 2>&1 | grep -E "dedup" | sed "s/^/$v: /"
           done
+      - name: Barrier idle report (IDLE=1)
+        run: |
+          sudo rm -rf /tmp/out/*
+          docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
+            -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 -e IDLE=1 shopsess:ci 2>&1 | grep -E "idle|wrote"
       - name: Single-thread parse stage breakdown (BENCH=1)
         run: |
           docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \

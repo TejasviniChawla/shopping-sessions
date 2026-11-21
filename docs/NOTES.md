@@ -120,3 +120,9 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   stated +-20% machine variance (queue wait 524 ms). Practice board is noisy; the final retimes. Choose by same-runner A/B.
   Dedup candidate ordering experiment: linear probing with slot-sorted inserts is quadratic (pass3 15 s) -> reverted.
   u64-halves splitter: -1 ns/line only (not integrated). Container overhead of our image on CI: 0.10 s.
+- 2026-11-22 ~07:30 ET: remaining plan (ranked): PGO in Docker build (~5%); mmap input with fault-around (~2-5%);
+  measure barrier idle; free raw partitions as dedup finishes (1-2%); skip mirrored links in UF (~1%); stamp cache (~2%).
+  Ruled out: block scanner, AVX-512, global table, sorted probes, oversubscription, parallel unmap, bulk populate.
+- 2026-11-22 ~08:30 ET: 4a83518 (u64-halves split, compact camp cells) A/B +4% vs 8ff776b; 10 seeds OK -> recommended.
+  Idle report: walk phase 22% idle (whales at the tail) -> heavy-persons-first scheduling (idle 5-10%).
+  PGO added to the Dockerfile (instrumented run on a generated 1M set; automatic fallback to a plain build).

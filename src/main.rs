@@ -98,6 +98,8 @@ struct ClFinal {
 struct LinkRaw {
     a: PKey,
     b: PKey,
+    /// the mirrored copy exists only so b's partition interns b; union-find skips it
+    mirror: bool,
 }
 
 struct Ctx {
@@ -133,6 +135,40 @@ impl<T> Shared<T> {
 
 fn log(t0: &Instant, msg: &str) {
     eprintln!("[{:7.3}s] {}", t0.elapsed().as_secs_f64(), msg);
+}
+
+/// Per-thread busy time of a phase, to quantify idle time at barriers (logged with IDLE=1).
+struct Busy {
+    ns: Vec<std::sync::atomic::AtomicU64>,
+    start: Instant,
+}
+impl Busy {
+    fn new(n: usize) -> Self {
+        Busy { ns: (0..n).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), start: Instant::now() }
+    }
+    #[inline(always)]
+    fn add(&self, t: usize, d: std::time::Duration) {
+        self.ns[t].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+    fn report(&self, name: &str) {
+        if std::env::var_os("IDLE").is_none() {
+            return;
+        }
+        let wall = self.start.elapsed().as_secs_f64();
+        let v: Vec<f64> = self.ns.iter().map(|a| a.load(Ordering::Relaxed) as f64 / 1e9).collect();
+        let max = v.iter().cloned().fold(0.0, f64::max);
+        let min = v.iter().cloned().fold(f64::MAX, f64::min);
+        let sum: f64 = v.iter().sum();
+        eprintln!(
+            "  idle {:<22} wall {:.3} busy max {:.3} min {:.3} mean {:.3} => idle {:.0}%",
+            name,
+            wall,
+            max,
+            min,
+            sum / v.len() as f64,
+            100.0 * (1.0 - sum / (v.len() as f64 * wall))
+        );
+    }
 }
 
 // ---------- small inputs ----------
@@ -287,13 +323,16 @@ where
     let next = AtomicUsize::new(0);
     let total_bytes: u64 = units.iter().map(|u| u.end - u.start).sum();
     let est = (total_bytes / 60) as usize / ctx.nthreads / P + 1024;
+    let busy = Busy::new(ctx.nthreads);
     let results: Vec<(Vec<HugeVec<T>>, Side)> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for t in 0..ctx.nthreads {
             let next = &next;
             let f = &f;
+            let busy = &busy;
             handles.push(s.spawn(move || {
                 pin_thread(t);
+                let tstart = Instant::now();
                 let aid = aid_base + t;
                 let mut side = Side::new();
                 let mut out: Scatter<T, P> = Scatter::new(est);
@@ -314,11 +353,14 @@ where
                         }
                     }
                 }
-                (out.finish(), side)
+                let r = (out.finish(), side);
+                busy.add(t, tstart.elapsed());
+                r
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    busy.report("parse");
     let mut outs = Vec::with_capacity(results.len());
     let mut sides = Vec::with_capacity(results.len());
     for (o, a) in results {
@@ -1130,6 +1172,7 @@ fn run() {
         cside: Side,
         lside: Side,
     }
+    let busy2 = Busy::new(nthreads);
     let p2: Vec<Phase2Out> = {
         let evp = Shared(evv.as_mut_ptr());
         let sides: &Sides = &sides_v[..];
@@ -1137,9 +1180,10 @@ fn run() {
             let mut hs = Vec::new();
             for t in 0..nthreads {
                 let next = &next;
-                let (ctx, inputs, ev_raw) = (&ctx, &inputs, &ev_raw);
+                let (ctx, inputs, ev_raw, busy2) = (&ctx, &inputs, &ev_raw, &busy2);
                 hs.push(s.spawn(move || {
                     pin_thread(t);
+                    let tstart = Instant::now();
                     let mut sc = Scratch::default();
                     let mut cout: Scatter<ClRaw, P> = Scatter::new(cl_est);
                     let mut lout: Scatter<LinkRaw, P> = Scatter::new(lk_est);
@@ -1177,14 +1221,16 @@ fn run() {
                                 let a = PKey::new(f[0], laid, &mut lside);
                                 let b = PKey::new(f[1], laid, &mut lside);
                                 let (pa, pb) = (part(a.hash_in(&lside)), part(b.hash_in(&lside)));
-                                lout.push(pb, LinkRaw { a: b, b: a });
-                                lout.push(pa, LinkRaw { a, b });
+                                lout.push(pb, LinkRaw { a: b, b: a, mirror: true });
+                                lout.push(pa, LinkRaw { a, b, mirror: false });
                             }
                         } else {
                             break;
                         }
                     }
-                    Phase2Out { clicks: cout.finish(), links: lout.finish(), cside, lside }
+                    let r = Phase2Out { clicks: cout.finish(), links: lout.finish(), cside, lside };
+                    busy2.add(t, tstart.elapsed());
+                    r
                 }));
             }
             hs.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1200,6 +1246,7 @@ fn run() {
     }
     let sides: &Sides = &sides_v[..];
     drop(inputs);
+    busy2.report("dedup+clicks/links");
     log(&t0, "event dedup + clicks/links parse done");
     // click dedup
     let next = AtomicUsize::new(0);
@@ -1287,6 +1334,9 @@ fn run() {
                     let mut v = Vec::new();
                     for t in links.iter() {
                         for l in t[q].iter() {
+                            if l.mirror {
+                                continue;
+                            }
                             let qb = part(l.b.hash(sides));
                             let ua = base[q] + parts[q].table.lookup(&l.a, sides).expect("link a");
                             let ub = base[qb] + parts[qb].table.lookup(&l.b, sides).expect("link b");
@@ -1407,13 +1457,37 @@ fn run() {
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let next = AtomicUsize::new(0);
     const BLOCK: usize = 512;
+    // Task list: heavy persons first (each its own task), then the remaining persons in blocks, so the whales
+    // never land at the tail of the phase. A task is (first person, count).
+    let mut tasks: Vec<(u32, u32)> = Vec::with_capacity(n_persons / BLOCK + 64);
+    let mut heavy: Vec<(u32, u32)> = Vec::new();
+    for p in 0..n_persons {
+        if ev_start[p + 1] - ev_start[p] >= 2048 {
+            heavy.push((ev_start[p + 1] - ev_start[p], p as u32));
+        }
+    }
+    heavy.sort_unstable_by(|a, b| b.cmp(a));
+    for &(_, p) in &heavy {
+        tasks.push((p, 1));
+    }
+    let mut p = 0usize;
+    while p < n_persons {
+        let e = (p + BLOCK).min(n_persons);
+        tasks.push((p as u32, (e - p) as u32));
+        p = e;
+    }
+    let heavy_set: std::collections::HashSet<u32> = heavy.iter().map(|&(_, p)| p).collect();
+    let tasks = &tasks;
+    let heavy_set = &heavy_set;
     let user_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&user_dir).expect("mkdir user_daily");
+    let busy5 = Busy::new(nthreads);
     let results: Vec<(Vec<CampCell>, usize)> = std::thread::scope(|s| {
         let mut hs = Vec::new();
         let evp = Shared(ev_final.as_ptr() as *mut EvFinal);
         let clp = Shared(cl_final.as_ptr() as *mut ClFinal);
         for t in 0..nthreads {
+            let busy5 = &busy5;
             let next = &next;
             let ctx = &ctx;
             let (ev_start, cl_start) = (&ev_start, &cl_start);
@@ -1421,17 +1495,19 @@ fn run() {
             let t0 = &t0;
             hs.push(s.spawn(move || {
                 pin_thread(t);
+                let tstart = Instant::now();
                 let (mut sort_ns, mut walk_ns) = (0u64, 0u64);
                 let mut radix_tmp: Vec<u64> = Vec::new();
                 let mut w = Walker::new(ctx, sides, day0, ndays);
                 loop {
-                    let b = next.fetch_add(1, Ordering::Relaxed) * BLOCK;
-                    if b >= n_persons {
+                    let ti = next.fetch_add(1, Ordering::Relaxed);
+                    if ti >= tasks.len() {
                         break;
                     }
-                    for p in b..(b + BLOCK).min(n_persons) {
+                    let (first, count) = tasks[ti];
+                    for p in first as usize..(first + count) as usize {
                         let (es, ee) = (ev_start[p] as usize, ev_start[p + 1] as usize);
-                        if es == ee {
+                        if es == ee || (count > 1 && ee - es >= 2048 && heavy_set.contains(&(p as u32))) {
                             continue;
                         }
                         let (cs, ce) = (cl_start[p] as usize, cl_start[p + 1] as usize);
@@ -1472,11 +1548,13 @@ fn run() {
                     out::write_user_daily(&user_dir.join(format!("part-{}.parquet", t)), uc).expect("write user_daily");
                 }
                 WALK_NS[2].fetch_add(tp0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                busy5.add(t, tstart.elapsed());
                 (w.camp, n_rows)
             }));
         }
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    busy5.report("walk+parquet");
     log(
         &t0,
         &format!(
