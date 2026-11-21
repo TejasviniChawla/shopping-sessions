@@ -622,6 +622,10 @@ impl Intern {
             s = (s + 1) & self.mask;
         }
     }
+    #[inline(always)]
+    fn prefetch(&self, k: &PKey, sides: &Sides) {
+        prefetch(unsafe { self.slots.as_ptr().add((k.hash(sides) as usize) & self.mask) });
+    }
     #[inline]
     fn lookup(&self, k: &PKey, sides: &Sides) -> Option<u32> {
         let mut s = (k.hash(sides) as usize) & self.mask;
@@ -642,6 +646,9 @@ struct Partition {
     table: Intern,
     events: HugeVec<EvMid>,
     clicks: HugeVec<ClMid>,
+    /// per local uid: number of events / clicks (the person histogram is derived from these)
+    ev_cnt: Vec<u32>,
+    cl_cnt: Vec<u32>,
 }
 
 fn intern_partition(
@@ -661,21 +668,50 @@ fn intern_partition(
             table.insert(l.a, sides);
         }
     }
+    const D: usize = 8;
+    let mut ev_cnt: Vec<u32> = vec![0; table.keys.len()];
     let mut events: HugeVec<EvMid> = HugeVec::with_capacity(nev);
     for v in evv {
-        for e in v[q].iter() {
+        let recs = &v[q][..];
+        let n = recs.len();
+        for i in 0..n.min(D) {
+            table.prefetch(&recs[i].user, sides);
+        }
+        for (i, e) in recs.iter().enumerate() {
+            if i + D < n {
+                table.prefetch(&recs[i + D].user, sides);
+            }
             let uid = table.insert(e.user, sides);
+            if uid as usize >= ev_cnt.len() {
+                ev_cnt.resize(uid as usize + 1, 0);
+            }
+            ev_cnt[uid as usize] += 1;
             events.push(EvMid { ts: e.ts, uid, packed: e.packed });
         }
     }
+    let mut cl_cnt: Vec<u32> = vec![0; table.keys.len()];
     let mut clicks: HugeVec<ClMid> = HugeVec::with_capacity(ncl);
     for v in clv {
-        for c in v[q].iter() {
+        let recs = &v[q][..];
+        let n = recs.len();
+        for i in 0..n.min(D) {
+            table.prefetch(&recs[i].user, sides);
+        }
+        for (i, c) in recs.iter().enumerate() {
+            if i + D < n {
+                table.prefetch(&recs[i + D].user, sides);
+            }
             let uid = table.insert(c.user, sides);
+            if uid as usize >= cl_cnt.len() {
+                cl_cnt.resize(uid as usize + 1, 0);
+            }
+            cl_cnt[uid as usize] += 1;
             clicks.push(ClMid { id: c.id, ts: c.ts, uid, camp: c.camp });
         }
     }
-    Partition { table, events, clicks }
+    ev_cnt.resize(table.keys.len(), 0);
+    cl_cnt.resize(table.keys.len(), 0);
+    Partition { table, events, clicks, ev_cnt, cl_cnt }
 }
 
 // ---------- union find ----------
@@ -1289,6 +1325,7 @@ fn run() {
         &person_of_uid,
         &base,
         |q| &parts[q].events[..],
+        |q| &parts[q].ev_cnt[..],
         |e| e.uid,
         |e| ((e.ts as u64) << 32) | e.packed as u64,
     );
@@ -1299,6 +1336,7 @@ fn run() {
         &person_of_uid,
         &base,
         |q| &parts[q].clicks[..],
+        |q| &parts[q].cl_cnt[..],
         |c| c.uid,
         |c| ClFinal { id: c.id, ts: c.ts, camp: c.camp },
     );
@@ -1411,10 +1449,12 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     person_of_uid: &[u32],
     base: &[u32],
     src: impl Fn(usize) -> &'a [S] + Sync + Send + Copy,
+    cnt_of: impl Fn(usize) -> &'a [u32] + Sync + Send + Copy,
     uid_of: impl Fn(&S) -> u32 + Sync + Send + Copy,
     conv: impl Fn(&S) -> T + Sync + Send + Copy,
 ) -> (HugeVec<T>, Vec<u32>) {
     let nt = ctx.nthreads;
+    // per-thread person histograms from the per-uid counts gathered while interning (no pass over records)
     let mut hist: Vec<Vec<u32>> = Vec::with_capacity(nt);
     {
         let mut hs: Vec<Option<Vec<u32>>> = (0..nt).map(|_| None).collect();
@@ -1426,8 +1466,10 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
                     let mut q = t;
                     while q < P {
                         let b = base[q] as usize;
-                        for r in src(q) {
-                            h[person_of_uid[b + uid_of(r) as usize] as usize] += 1;
+                        for (u, &c) in cnt_of(q).iter().enumerate() {
+                            if c != 0 {
+                                h[person_of_uid[b + u] as usize] += c;
+                            }
                         }
                         q += nt;
                     }

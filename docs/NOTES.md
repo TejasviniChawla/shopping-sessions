@@ -113,3 +113,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~04:30 ET: SCORER 574a577 = 1.62 s. 6925b5e (Snappy writer) A/B: -5% in-container, -3% wall, exit gap gone; 10 seeds OK.
   342c221 (dictionary user_id + INT32 counts) neutral vs 6925b5e; 10 seeds OK; recommended submission.
   CI gains translate to the scorer at ~40%: large fixed cost (container start + output flush) on the scorer.
+- 2026-11-22 ~05:30 ET: x86 isolated bench (Zen3, ns/line): scan 20 | split 19 | ts 10 | ingest 5 | keys 8 | type/hash 8 | push 15.
+  Block-based scanner prototype is NOT faster than the per-line 128-byte masks (22.9 vs 20.2 ns/line realistic): dropped.
+  Batch: intern-table prefetch; person histogram derived from per-uid counts gathered during intern (no record pass).
