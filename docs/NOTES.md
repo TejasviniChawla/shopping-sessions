@@ -87,3 +87,8 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   (pass2 0.4-0.6 thread-s dominates) | intern 0.09 | persons 0.06 | group 0.05 | walk 0.09 | out 0.05.
   Lesson: never run commit/push in a background chain while editing; a chain's `git add -A` swallowed unrelated edits twice.
   Experiments in flight: USE_MMAP=1 (mmap+MAP_POPULATE per unit), dedup isolation toggles.
+- 2026-11-21 ~10:00: CI 7763 (Zen3) for 4922f03: 1.33 s in-container (parse 0.57, dedup 0.22, intern 0.11, persons 0.06, group 0.07,
+  walk 0.11, out 0.06) ~= flat vs the earlier 7763 run. 10 seeds MATCH. Populate hurt (4K pages before madvise) -> opt-in only.
+  PLAN (restructure): links parsed first -> global concurrent user table (CAS) + UF -> person ids for link IDs;
+  dedup pass 2 does table.get_or_insert(user) -> person id directly -> EvMid{ts,person,packed} per thread + per-thread
+  person histograms; drop EvValid scatter, intern phase and separate histogram pass. Expected -0.1..0.15 s on Zen4-4vCPU-10M.
