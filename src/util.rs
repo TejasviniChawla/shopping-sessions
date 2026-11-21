@@ -194,7 +194,7 @@ const HUGE_MIN: usize = 2 << 20;
 
 #[cfg(target_os = "linux")]
 fn populate() -> libc::c_int {
-    if std::env::var_os("NO_POPULATE").is_some() { 0 } else { libc::MAP_POPULATE }
+    if std::env::var_os("POPULATE").is_some() { libc::MAP_POPULATE } else { 0 }
 }
 #[cfg(not(target_os = "linux"))]
 fn populate() -> libc::c_int {
@@ -537,6 +537,13 @@ impl PKey {
             p = p.saturating_mul(37);
         }
         v * POW37[(12 - n) as usize]
+    }
+    /// Inverse of `lex_key`: strip the right padding of zero digits.
+    pub fn from_lex_key(mut l: u64) -> PKey {
+        while l != 0 && l % 37 == 0 {
+            l /= 37;
+        }
+        PKey(l)
     }
     #[inline]
     pub fn cmp_bytes(&self, other: &PKey, sides: &Sides) -> std::cmp::Ordering {

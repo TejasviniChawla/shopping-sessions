@@ -328,7 +328,7 @@ struct Sketch {
 }
 impl Sketch {
     fn new(total: usize) -> Self {
-        let slots = (total * 16).max(1024).next_power_of_two();
+        let slots = (total * 32).max(1024).next_power_of_two();
         Sketch { words: vec![0u64; slots / 32], mask: slots - 1 }
     }
     #[inline(always)]
@@ -1120,21 +1120,55 @@ fn run() {
     for q in 0..P {
         id_key.extend_from_slice(&parts[q].table.keys);
     }
-    // roots, names, person indexes
+    // roots and person indexes (sequential, cheap), then names by parallel atomic-min over lex keys
     let mut person_of_uid = vec![u32::MAX; n_ids];
-    let mut person_name: Vec<PKey> = Vec::new();
+    let mut root_of_person: Vec<u32> = Vec::new();
     for u in 0..n_ids as u32 {
         let r = find(&mut parent, u);
         if person_of_uid[r as usize] == u32::MAX {
-            person_of_uid[r as usize] = person_name.len() as u32;
-            person_name.push(id_key[r as usize]);
+            person_of_uid[r as usize] = root_of_person.len() as u32;
+            root_of_person.push(r);
         }
-        let pi = person_of_uid[r as usize];
-        if r != u {
-            person_of_uid[u as usize] = pi;
-            if id_key[u as usize].cmp_bytes(&person_name[pi as usize], sides) == std::cmp::Ordering::Less {
-                person_name[pi as usize] = id_key[u as usize];
+        person_of_uid[u as usize] = person_of_uid[r as usize];
+    }
+    let np = root_of_person.len();
+    // packed keys: numeric min of lex_key; fallback keys handled sequentially afterwards
+    let best: Vec<std::sync::atomic::AtomicU64> = (0..np).map(|_| std::sync::atomic::AtomicU64::new(u64::MAX)).collect();
+    let fallback_ids: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    {
+        let chunk = (n_ids + nthreads - 1) / nthreads;
+        std::thread::scope(|s| {
+            for t in 0..nthreads {
+                let (best, fallback_ids, id_key, person_of_uid) = (&best, &fallback_ids, &id_key, &person_of_uid);
+                s.spawn(move || {
+                    let lo = t * chunk;
+                    let hi = ((t + 1) * chunk).min(n_ids);
+                    let mut fb = Vec::new();
+                    for u in lo..hi {
+                        let k = id_key[u];
+                        if k.is_packed() {
+                            best[person_of_uid[u] as usize].fetch_min(k.lex_key(), Ordering::Relaxed);
+                        } else {
+                            fb.push(u as u32);
+                        }
+                    }
+                    if !fb.is_empty() {
+                        fallback_ids.lock().unwrap().extend(fb);
+                    }
+                });
             }
+        });
+    }
+    let mut person_name: Vec<PKey> = Vec::with_capacity(np);
+    for pi in 0..np {
+        let b = best[pi].load(Ordering::Relaxed);
+        person_name.push(if b == u64::MAX { PKey(u64::MAX) } else { PKey::from_lex_key(b) });
+    }
+    for &u in fallback_ids.lock().unwrap().iter() {
+        let pi = person_of_uid[u as usize] as usize;
+        let cur = person_name[pi];
+        if cur.0 == u64::MAX || id_key[u as usize].cmp_bytes(&cur, sides) == std::cmp::Ordering::Less {
+            person_name[pi] = id_key[u as usize];
         }
     }
     let n_persons = person_name.len();
