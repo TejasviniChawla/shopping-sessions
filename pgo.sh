@@ -4,7 +4,7 @@ set -e
 T="$1"
 rustup component add llvm-tools-preview
 (cd tools/generator && cargo build --release -q)
-tools/generator/target/release/generate --seed 3 --events 1000000 --clicks 250000 --output /tmp/pgo-data
+tools/generator/target/release/generate --seed 5 --events 3000000 --clicks 750000 --output /tmp/pgo-data
 RUSTFLAGS="$BASEFLAGS -C profile-generate=/tmp/pgo-prof" cargo build --release -q --target "$T"
 mkdir -p /tmp/pgo-out
 DATA_DIR=/tmp/pgo-data OUTPUT_DIR=/tmp/pgo-out NCPU=4 NO_FORK=1 "target/$T/release/shopsess"
