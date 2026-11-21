@@ -69,3 +69,4 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   10M Mac: 0.88 s total (parse 0.27-0.35, dedup 0.2, intern 0.06, group 0.1, walk+out 0.08). RSS 0.8 GB.
 - 2026-11-21 01:40: SWAR pack8 for 8/9-char IDs. 8 seeds MATCH reference. Mac timings vary 0.9-2.0 s on 10M depending on
   Docker Desktop / thermal state: this machine cannot benchmark reliably. Need an x86 Linux box (GitHub Actions or a VM).
+- 2026-11-21 03:00: public repo created (user approved): https://github.com/TejasviniChawla/shopping-sessions. First x86 CI bench launched.
