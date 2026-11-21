@@ -227,6 +227,31 @@ fn pool_put(p: *mut u8, bytes: usize) {
     POOL.lock().unwrap().push((p as usize, bytes));
 }
 
+/// Unmap everything in the pool using `nthreads` threads. Called right before exit, when most threads are
+/// idle, so the page-table teardown is parallel instead of serialized in the kernel's exit path.
+pub fn pool_drain_parallel(nthreads: usize) {
+    if std::env::var_os("NO_DRAIN").is_some() {
+        return;
+    }
+    let items: Vec<(usize, usize)> = std::mem::take(&mut *POOL.lock().unwrap());
+    if items.is_empty() {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..nthreads.max(1) {
+            let (next, items) = (&next, &items);
+            s.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                unsafe { libc::munmap(items[i].0 as *mut libc::c_void, items[i].1) };
+            });
+        }
+    });
+}
+
 fn map_bytes(bytes: usize) -> *mut u8 {
     if let Some(p) = pool_take(bytes) {
         return p;

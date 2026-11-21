@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_f1_cached, parse_ingest, parse_ts, parse_ts_cached, DAY};
-use util::{pin_thread, prefetch, HugeVec, PKey, Scatter, Side, Sides, SmallTable};
+use util::{pin_thread, pool_drain_parallel, prefetch, HugeVec, PKey, Scatter, Side, Sides, SmallTable};
 
 const LOG_P: u32 = 5;
 const P: usize = 1 << LOG_P;
@@ -1401,6 +1401,11 @@ fn run() {
     }
     out::write_campaign_daily(&outdir.join("campaign_daily"), cc).expect("write campaign_daily");
     log(&t0, &format!("wrote {} user rows", n_rows));
+    // release the big arrays, then unmap the pool in parallel so exit is cheap
+    drop(ev_final);
+    drop(cl_final);
+    pool_drain_parallel(nthreads);
+    log(&t0, "memory released");
 }
 
 /// Counting-sort records from P partition vectors into one array grouped by person. Returns (array, start offsets).
