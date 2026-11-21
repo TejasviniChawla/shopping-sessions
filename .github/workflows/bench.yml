@@ -107,6 +107,18 @@ jobs:
             DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out3 NCPU=4 NO_FORK=1 /usr/bin/time -f "elapsed %e s, sys %S s" /tmp/shopsess_$b 2>&1 | grep -E "wrote|elapsed"
             du -sh /tmp/out3 | cut -f1
           done
+      - name: Output on tmpfs vs bind mount (main and comparison images)
+        if: ${{ github.event.inputs.compare != '' }}
+        run: |
+          for img in ci cmp ci cmp; do
+            echo "=== $img, output on tmpfs ==="
+            /usr/bin/time -f "wall %e s" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m --cpus 4 --memory 12g --user 1000:1000 \
+              -v /tmp/data:/data:ro -e DATA_DIR=/data -e OUTPUT_DIR=/tmp/o -e NCPU=4 shopsess:$img 2>&1 | grep -E "wrote|wall"
+            sudo rm -rf /tmp/out/*
+            echo "=== $img, output on bind mount ==="
+            /usr/bin/time -f "wall %e s" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m --cpus 4 --memory 12g --user 1000:1000 \
+              -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 shopsess:$img 2>&1 | grep -E "wrote|wall"
+          done
       - name: Env experiments (native, perf stat)
         if: ${{ github.event.inputs.envs != '' }}
         run: |
