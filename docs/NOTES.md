@@ -195,3 +195,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   running (frozen binary); merge to main after MATCH. 30M run of main dispatched. Remaining ideas all <= 2%.
 - 2026-11-21 ~10:00 ET: main f616eb8 at 30M on Zen4 9V45 (4 thr): in-process 1.53 s, wall 1.82 s (10M: 0.55) -> sublinear,
   17.9M of 29.4M events re-scattered in round A. 60M run dispatched as a robustness check (runner disk may not hold it).
+- 2026-11-21 ~10:30 ET: main f616eb8 at 60M (seed 13) on Zen4 9V74 (4 thr): in-process 4.5-5.4 s (parse 2.3-3.1, cold
+  page cache on first runs), wall 4.97-5.91 s; 58.9M events, 14.8M clicks, 6.59M user rows; no OOM. 1024 partitions ->
+  ~57k records/partition, dedup table 2 MB (L3) still fine.
