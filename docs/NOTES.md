@@ -190,3 +190,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   clocks). Parse cost is instructions + mispredicts, not cache/TLB/scheduling. Events 65-96 B (99.8%), clicks <= 64 B
   -> mask builder exits at the chunk holding the newline (A/B vs two-round commit dispatched).
 - 2026-11-21 ~09:00 ET: two-round build ten seeds MATCH (frozen binary) -> main fast-forwarded to f616eb8 (recommended).
+- 2026-11-21 ~09:30 ET: c8989a5 (mask builder exits at the newline chunk) vs two-round f616eb8 on Zen4 9V74: WIN parse
+  .334/.336 vs .352/.356, in-process .70/.71 vs .72, wall .92/.93 vs .93/.94; scan+parse 1.02 vs 1.07 thread-s. Seed check
+  running (frozen binary); merge to main after MATCH. 30M run of main dispatched. Remaining ideas all <= 2%.
