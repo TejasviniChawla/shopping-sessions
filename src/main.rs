@@ -833,6 +833,8 @@ fn run() {
         .clamp(1, 16);
 
     let (ws, we) = read_manifest(&data.join("manifest.json"));
+    // Timestamps are stored as u32 ms offsets from the window start (events) or start - 7 days (clicks).
+    assert!(we > ws && (we - ws + REACH) < u32::MAX as i64, "window too wide for u32 ms offsets");
     let prods = read_small_csv(&data.join("products.csv"));
     let camps = read_small_csv(&data.join("campaigns.csv"));
 
