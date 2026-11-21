@@ -138,7 +138,7 @@ jobs:
             for i in 1 2; do
               rm -rf /tmp/out2; mkdir -p /tmp/out2
               echo "=== env [$e] run $i ==="
-              env $e DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf stat -e task-clock,page-faults /tmp/shopsess 2>&1 | grep -E "wrote|page-faults|seconds (user|sys|time)"
+              env $e DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf stat -e task-clock,page-faults /tmp/shopsess 2>&1 | grep -E "wrote|page-faults|seconds (user|sys|time)|thread-seconds|link task|parsed|partitions"
             done
           done
       - name: Container overhead of our image (EXIT_NOW, scorer flags, warm)
