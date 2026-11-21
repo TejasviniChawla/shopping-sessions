@@ -174,3 +174,10 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   -> split_masked rewritten as ONE branch-free loop (fixed 6-iteration u128 comma walk, expected-quote-mask == qm check,
   no pext, no no-quote fast path): orig 0.34 == noq 0.33 now. Scatter staging 4 records per flush (flush branch 25%).
   all-view / all-F1 variants: within noise -> etype and ts-form branches are not major. A/B vs 6d5c18e dispatched.
+- 2026-11-21 ~07:00 ET: A/B results vs main 6d5c18e (same runner each): 29c8e10 branch-free splitter LOST (parse .39 vs .355
+  on GNR; Mac win was software-pext artifact). d517606 (two-pass dedup + 4-record staging, pext splitter) NEUTRAL (Zen4 9V74;
+  the 1.23/1.33 walls in the first step were runner noise, later steps 0.88-0.91 == cmp). 8f1682d (v3b) confirms new splitter
+  slower. x86 data variants (Zen3): no-quotes saves 10-20% of scan+parse, all-view ~0. a0b3a3d-ish batch (single pext path,
+  insertion sorts <=32, link-map prefetch) NEUTRAL (0.88/0.94 vs 0.89/0.93); link task 0.115 s unchanged by prefetch.
+  Two-round person stage (route by user, resolve each distinct user once, re-scatter 61% linked events by name): fixtures
+  36/36, dev MATCH; CI A/B dispatched. Mac timings unusable while seedcheck's Python reference runs.
