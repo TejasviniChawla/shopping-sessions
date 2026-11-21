@@ -83,3 +83,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   candidates). Prefetch D=16. Intern table est shrunk. All checks pass.
 - 2026-11-21 07:30: SCORER RESULT for commit 7526431: 1.79 s (leader 1.0). CI Zen4-4vCPU-10M in-container ~1.08 s => scorer ~1.4 + 0.35 docker.
   Since: pass-2 prefetch, packed events (16/12/8 B), links mirrored into both partitions (removes 32x scan of all links in intern).
+- 2026-11-21 08:30: commit 4438fa6 CI (Zen4 4vCPU 10M): 1.01-1.06 s in-container: parse 0.375 | clicks+links 0.105 | dedup 0.18-0.24
+  (pass2 0.4-0.6 thread-s dominates) | intern 0.09 | persons 0.06 | group 0.05 | walk 0.09 | out 0.05.
+  Lesson: never run commit/push in a background chain while editing; a chain's `git add -A` swallowed unrelated edits twice.
+  Experiments in flight: USE_MMAP=1 (mmap+MAP_POPULATE per unit), dedup isolation toggles.

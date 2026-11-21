@@ -49,6 +49,13 @@ jobs:
           sudo rm -rf /tmp/out/*
           /usr/bin/time -f "wall %e s" docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
             -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 -e USE_MMAP=1 shopsess:ci
+      - name: Dedup isolation (skip emit / skip candidates)
+        run: |
+          for v in DEDUP_SKIP_EMIT DEDUP_SKIP_CANDS; do
+            sudo rm -rf /tmp/out/*
+            docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
+              -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 -e $v=1 shopsess:ci 2>&1 | grep -E "dedup" | sed "s/^/$v: /"
+          done
       - name: Single-thread parse stage breakdown (BENCH=1)
         run: |
           docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \

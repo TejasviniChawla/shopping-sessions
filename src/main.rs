@@ -386,6 +386,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
     DEDUP_NS[0].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let tp = Instant::now();
     // pass 2: unique keys are winners; candidates go through an exact table (min ingest wins)
+    let skip_emit = std::env::var_os("DEDUP_SKIP_EMIT").is_some();
+    let skip_cands = std::env::var_os("DEDUP_SKIP_CANDS").is_some();
     let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
     let mut cands: Vec<u32> = Vec::with_capacity(total / 8 + 64);
     let cap = (total / 4).max(64).next_power_of_two();
@@ -408,8 +410,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
                 sk.prefetch(recs[i + D].id.hash(sides));
             }
             let h = r.id.hash(sides);
-            if sk.count(h) < 2 {
-                if event_ok(r) {
+            if sk.count(h) < 2 || skip_cands {
+                if event_ok(r) && !skip_emit {
                     out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
                 }
                 continue;
