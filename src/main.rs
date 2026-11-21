@@ -479,6 +479,7 @@ const PF: usize = 24;
 
 /// Timing accumulators (thread-nanoseconds) for the dedup and person stages, printed when TIMING is set.
 static T_DEDUP: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static T_PARSE: [std::sync::atomic::AtomicU64; 3] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 static T_PERSON: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -1109,13 +1110,15 @@ fn run() {
                             let t_links = Instant::now();
                             let n_links = links.len();
                             let lm = build_link_map(&links);
-                            if std::env::var_os("QUIET").is_none() {
+                            if timing {
                                 eprintln!("    link task: {} links, map built in {:.3}s", n_links, t_links.elapsed().as_secs_f64());
                             }
                             unsafe { *lm_ptr.p() = Some(lm) };
                         } else if i - 1 < inputs.events.len() {
                             let u = inputs.events[i - 1];
+                            let mut tm = Instant::now();
                             buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+                            tick(timing, &T_PARSE[0], &mut tm);
                             let (lo, hi) = (buf.lo, buf.hi);
                             let data = buf.data();
                             let mut sc = Scanner::new(data, lo, hi);
@@ -1124,6 +1127,7 @@ fn run() {
                                     out.push(part(r.id.hash(), log_p), r);
                                 }
                             }
+                            tick(timing, &T_PARSE[1], &mut tm);
                         } else {
                             break;
                         }
@@ -1259,8 +1263,8 @@ fn run() {
     if timing {
         let g = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
-            "    thread-seconds: dedup probe {:.3}, dedup emit {:.3}; person ids {:.3}, counting sort {:.3}, sorts {:.3}, walk {:.3}",
-            g(&T_DEDUP[0]), g(&T_DEDUP[1]), g(&T_PERSON[0]), g(&T_PERSON[1]), g(&T_PERSON[2]), g(&T_PERSON[3])
+            "    thread-seconds: event pread {:.3}, event scan+parse {:.3}; dedup probe {:.3}, dedup emit {:.3}; person ids {:.3}, counting sort {:.3}, sorts {:.3}, walk {:.3}",
+            g(&T_PARSE[0]), g(&T_PARSE[1]), g(&T_DEDUP[0]), g(&T_DEDUP[1]), g(&T_PERSON[0]), g(&T_PERSON[1]), g(&T_PERSON[2]), g(&T_PERSON[3])
         );
     }
 
