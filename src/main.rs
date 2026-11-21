@@ -385,20 +385,15 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
     }
     DEDUP_NS[0].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let tp = Instant::now();
-    // pass 2: unique keys are winners; candidates go through an exact table (min ingest wins)
+    // pass 2: unique keys are winners and are emitted now; candidates are collected for a prefetched pass 3
     let skip_emit = std::env::var_os("DEDUP_SKIP_EMIT").is_some();
     let skip_cands = std::env::var_os("DEDUP_SKIP_CANDS").is_some();
     let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
     let mut cands: Vec<u32> = Vec::with_capacity(total / 8 + 64);
-    let cap = (total / 4).max(64).next_power_of_two();
-    let mask = cap - 1;
-    let mut slots: Vec<(u32, PKey)> = vec![(u32::MAX, PKey(0)); cap];
     let mut off = vec![0usize; raws.len() + 1];
     for t in 0..raws.len() {
         off[t + 1] = off[t] + raws[t][p].len();
     }
-    let mut win = vec![0u64; (total + 63) / 64 + 1];
-    let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
         let n = recs.len();
@@ -414,45 +409,60 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
                 if event_ok(r) && !skip_emit {
                     out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
                 }
-                continue;
-            }
-            let packed = ((t as u32) << 27) | (i as u32);
-            let dense = off[t] + i;
-            cands.push(packed);
-            let mut s = (h as usize) & mask;
-            loop {
-                let (cur, ck) = slots[s];
-                if cur == u32::MAX {
-                    slots[s] = (packed, r.id);
-                    win[dense >> 6] |= 1 << (dense & 63);
-                    break;
-                }
-                if ck.same(&r.id, sides) {
-                    let o = get(cur);
-                    if r.ingest < o.ingest {
-                        slots[s] = (packed, r.id);
-                        let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
-                        win[od >> 6] &= !(1 << (od & 63));
-                        win[dense >> 6] |= 1 << (dense & 63);
-                    }
-                    break;
-                }
-                s = (s + 1) & mask;
+            } else {
+                cands.push(((t as u32) << 27) | (i as u32));
             }
         }
     }
     DEDUP_NS[1].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     DEDUP_NS[3].fetch_add(cands.len() as u64, Ordering::Relaxed);
     let tp = Instant::now();
-    // pass 3: candidate winners
+    // pass 3: exact table over candidates only (min ingest wins), slot prefetched D ahead
+    let cap = (cands.len() * 2).max(64).next_power_of_two();
+    let mask = cap - 1;
+    let mut slots: Vec<(u32, PKey)> = vec![(u32::MAX, PKey(0)); cap];
+    let mut win = vec![0u64; (total + 63) / 64 + 1];
+    let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
+    let nc = cands.len();
+    for k in 0..nc.min(D) {
+        prefetch(unsafe { slots.as_ptr().add((get(cands[k]).id.hash(sides) as usize) & mask) });
+    }
+    for k in 0..nc {
+        if k + D < nc {
+            prefetch(unsafe { slots.as_ptr().add((get(cands[k + D]).id.hash(sides) as usize) & mask) });
+        }
+        let packed = cands[k];
+        let r = get(packed);
+        let h = r.id.hash(sides);
+        let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
+        let mut s = (h as usize) & mask;
+        loop {
+            let (cur, ck) = slots[s];
+            if cur == u32::MAX {
+                slots[s] = (packed, r.id);
+                win[dense >> 6] |= 1 << (dense & 63);
+                break;
+            }
+            if ck.same(&r.id, sides) {
+                let o = get(cur);
+                if r.ingest < o.ingest {
+                    slots[s] = (packed, r.id);
+                    let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
+                    win[od >> 6] &= !(1 << (od & 63));
+                    win[dense >> 6] |= 1 << (dense & 63);
+                }
+                break;
+            }
+            s = (s + 1) & mask;
+        }
+    }
+    // candidate winners
     for &packed in &cands {
-        let t = (packed >> 27) as usize;
-        let i = (packed & 0x7FF_FFFF) as usize;
-        let dense = off[t] + i;
+        let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
         if (win[dense >> 6] >> (dense & 63)) & 1 == 0 {
             continue;
         }
-        let r = &raws[t][p][i];
+        let r = get(packed);
         if event_ok(r) {
             out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
         }

@@ -192,13 +192,23 @@ const HUGE: usize = 2 << 20;
 /// Below this size an allocation uses normal pages and page-size rounding (P*P small vectors must not each take 2 MB).
 const HUGE_MIN: usize = 2 << 20;
 
+#[cfg(target_os = "linux")]
+fn populate() -> libc::c_int {
+    if std::env::var_os("NO_POPULATE").is_some() { 0 } else { libc::MAP_POPULATE }
+}
+#[cfg(not(target_os = "linux"))]
+fn populate() -> libc::c_int {
+    0
+}
+
 fn map_bytes(bytes: usize) -> *mut u8 {
     unsafe {
+        // MAP_POPULATE: the kernel maps and zeroes all pages in one go, instead of one trap per page.
         let p = libc::mmap(
             std::ptr::null_mut(),
             bytes,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | populate(),
             -1,
             0,
         );
