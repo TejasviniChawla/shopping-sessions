@@ -70,3 +70,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 01:40: SWAR pack8 for 8/9-char IDs. 8 seeds MATCH reference. Mac timings vary 0.9-2.0 s on 10M depending on
   Docker Desktop / thermal state: this machine cannot benchmark reliably. Need an x86 Linux box (GitHub Actions or a VM).
 - 2026-11-21 03:00: public repo created (user approved): https://github.com/TejasviniChawla/shopping-sessions. First x86 CI bench launched.
+- 2026-11-21 03:50: first x86 CI (Ice Lake 8370C, 4 vCPU, 10M): 1.58 s in-container: parse 0.64 | clicks+links 0.13 | dedup 0.24 |
+  intern 0.15 | persons 0.09 | group 0.12 | walk+out 0.19. Then: branchless quote handling, lex_key (no base-37 decode in naming),
+  parallel link resolution, P=64 partitions, per-thread grouping histograms. Mac 10M best 0.89 s.

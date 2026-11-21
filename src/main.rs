@@ -14,7 +14,7 @@ use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
 use util::{prefetch, HugeVec, PKey, Side, Sides, SmallTable};
 
-const LOG_P: u32 = 4;
+const LOG_P: u32 = 6;
 const P: usize = 1 << LOG_P;
 const SESSION_GAP: i64 = 30 * ts::MINUTE;
 const LATE: i64 = DAY;
@@ -1132,6 +1132,7 @@ fn run() {
 }
 
 /// Counting-sort records from P partition vectors into one array grouped by person. Returns (array, start offsets).
+/// Thread t owns the source partitions q with q % nthreads == t, so there are nthreads histograms, not P.
 fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     ctx: &Ctx,
     n_persons: usize,
@@ -1142,25 +1143,24 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     uid_of: impl Fn(&S) -> u32 + Sync + Send + Copy,
     conv: impl Fn(&S) -> T + Sync + Send + Copy,
 ) -> (HugeVec<T>, Vec<u32>) {
-    let mut hist: Vec<Vec<u32>> = Vec::with_capacity(P);
+    let nt = ctx.nthreads;
+    let mut hist: Vec<Vec<u32>> = Vec::with_capacity(nt);
     {
-        let next = AtomicUsize::new(0);
-        let mut hs: Vec<Option<Vec<u32>>> = (0..P).map(|_| None).collect();
+        let mut hs: Vec<Option<Vec<u32>>> = (0..nt).map(|_| None).collect();
         let hp = Shared(hs.as_mut_ptr());
         std::thread::scope(|s| {
-            for _ in 0..ctx.nthreads {
-                let next = &next;
-                s.spawn(move || loop {
-                    let q = next.fetch_add(1, Ordering::Relaxed);
-                    if q >= P {
-                        break;
-                    }
+            for t in 0..nt {
+                s.spawn(move || {
                     let mut h = vec![0u32; n_persons];
-                    let b = base[q] as usize;
-                    for r in src(q) {
-                        h[person_of_uid[b + uid_of(r) as usize] as usize] += 1;
+                    let mut q = t;
+                    while q < P {
+                        let b = base[q] as usize;
+                        for r in src(q) {
+                            h[person_of_uid[b + uid_of(r) as usize] as usize] += 1;
+                        }
+                        q += nt;
                     }
-                    unsafe { *hp.p().add(q) = Some(h) };
+                    unsafe { *hp.p().add(t) = Some(h) };
                 });
             }
         });
@@ -1171,9 +1171,9 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     let mut start = vec![0u32; n_persons + 1];
     for p in 0..n_persons {
         let mut tot = 0u32;
-        for q in 0..P {
-            let c = hist[q][p];
-            hist[q][p] = start[p] + tot;
+        for t in 0..nt {
+            let c = hist[t][p];
+            hist[t][p] = start[p] + tot;
             tot += c;
         }
         start[p + 1] = start[p] + tot;
@@ -1181,24 +1181,23 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     debug_assert_eq!(start[n_persons] as usize, n);
     let mut out: HugeVec<T> = HugeVec::with_len_uninit(n);
     {
-        let next = AtomicUsize::new(0);
         let op = Shared(out.as_mut_ptr());
-        let hist = &hist;
+        let hist = &mut hist;
+        let hp = Shared(hist.as_mut_ptr());
         std::thread::scope(|s| {
-            for _ in 0..ctx.nthreads {
-                let next = &next;
-                s.spawn(move || loop {
-                    let q = next.fetch_add(1, Ordering::Relaxed);
-                    if q >= P {
-                        break;
-                    }
-                    let mut pos = hist[q].clone();
-                    let b = base[q] as usize;
-                    for r in src(q) {
-                        let p = person_of_uid[b + uid_of(r) as usize] as usize;
-                        let d = pos[p];
-                        pos[p] += 1;
-                        unsafe { *op.p().add(d as usize) = conv(r) };
+            for t in 0..nt {
+                s.spawn(move || {
+                    let pos: &mut Vec<u32> = unsafe { &mut *hp.p().add(t) };
+                    let mut q = t;
+                    while q < P {
+                        let b = base[q] as usize;
+                        for r in src(q) {
+                            let p = person_of_uid[b + uid_of(r) as usize] as usize;
+                            let d = pos[p];
+                            pos[p] += 1;
+                            unsafe { *op.p().add(d as usize) = conv(r) };
+                        }
+                        q += nt;
                     }
                 });
             }
