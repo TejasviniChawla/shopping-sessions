@@ -185,3 +185,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   0.718/0.720, wall 0.88/0.90 vs 0.90/0.92. dedup emit 0.31 -> 0.11 thread-s; round A+B grouping 0.16 (was 0.09), sorts 0.22,
   walk 0.24. 61% of events belong to linked persons and are re-scattered. Env sweeps dispatched: UNIT_KB 128/2048, LOG_P 7/8,
   PIN=0. Parse is now ~49% of in-process time (1.08 thread-s / 10M = 108 ns/line on Zen4), the dominant remaining cost.
+- 2026-11-21 ~08:30 ET: CI env sweeps (two-round build, native 4 thr 10M): UNIT_KB 128/512/2048 flat; LOG_P 7/8/10 flat;
+  PIN=0 == pinned. Zen4 9V45: in-process 0.55-0.56 s, scan+parse 0.76-0.80 thread-s (76-80 ns/line); 9V74: 1.07 (slower
+  clocks). Parse cost is instructions + mispredicts, not cache/TLB/scheduling. Events 65-96 B (99.8%), clicks <= 64 B
+  -> mask builder exits at the chunk holding the newline (A/B vs two-round commit dispatched).
