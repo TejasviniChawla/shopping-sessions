@@ -167,3 +167,10 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   counting sort 0.02, sorts 0.12, walk 0.16-0.18. Events are in random time order (no pre-sorted shortcut).
   CI timing run 44880051547 (TIMING, USE_MMAP, LOG_P=8 sets). Deferred: resolve person once per distinct user (~2% at 10M,
   more at 60M); 12 B link slots (keys+u32 names) to keep the map in L3.
+- 2026-11-21 ~05:30 ET: CI TIMING (SPR 8573C, 4 thr, 10M): event pread 0.10-0.13 thread-s, scan+parse 1.10 (110 ns/line!),
+  link task 0.12 s on one worker; dedup probe 0.14, emit 0.31; person ids 0.10, counting 0.035, sorts 0.18, walk 0.275.
+  USE_MMAP no gain; LOG_P 10 >= 8. 882ead9 ten seeds MATCH.
+  Mac data-variant experiment (36 event files, 2.8M lines): stripping all quotes cut scan+parse 0.45 -> 0.30 thread-s.
+  -> split_masked rewritten as ONE branch-free loop (fixed 6-iteration u128 comma walk, expected-quote-mask == qm check,
+  no pext, no no-quote fast path): orig 0.34 == noq 0.33 now. Scatter staging 4 records per flush (flush branch 25%).
+  all-view / all-F1 variants: within noise -> etype and ts-form branches are not major. A/B vs 6d5c18e dispatched.
