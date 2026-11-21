@@ -95,3 +95,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 ~11:00: d200c39 (global lock-free user table, 16B slots; fused dedup/intern/histogram) on Ice Lake 8370C CI:
   1.37 s in-container (links 0.15 | parse 0.50 | clicks 0.12 | dedup+intern 0.35 | group 0.07 | walk 0.12 | out 0.06).
   Earlier 8370C runs: 1.58 (first), 1.46-1.51 (P=32 build). Submitted d200c39 as the second practice run.
+- 2026-11-21 ~23:20 ET: SCORER: d200c39 (global user table restructure) = 2.17 s, WORSE than 7526431 (1.79 s). Zen3 CI agreed
+  (1.46 vs 1.33). Cross-runner CI comparisons misled; only same-runner A/B from now on. Reverting src/ to the 4922f03 design.
