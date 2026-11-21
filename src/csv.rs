@@ -219,7 +219,8 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
         return true;
     }
     // quotes: a quote is valid only as the first and last byte of a field of length >= 2.
-    // Branchless per field: start += open, end -= open, and a mismatch between open and close marks the line bad.
+    // Per non-empty field, extract its open and close bits with pext (one bit per field, in field order);
+    // the line is valid iff the two patterns agree. Empty fields have no first/last byte and no quotes.
     let starts = (cm << 1) | 1;
     let ends = (cm >> 1) | (1u128 << (n - 1));
     let open = qm & starts;
@@ -227,24 +228,56 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
     if (open | close) != qm || (open & close) != 0 {
         return false;
     }
-    let mut s = 0usize;
     let mut c = cm | (1u128 << n);
-    let mut bad = 0u32;
+    let starts_ne = starts & !c;
+    let ends_ne = ends & !cm;
+    let ob = pext128(open, starts_ne);
+    let cb = pext128(close, ends_ne);
+    if ob != cb {
+        return false;
+    }
+    let mut s = 0usize;
+    let mut ob = ob as u32;
     for k in 0..N {
         let e = c.trailing_zeros() as usize;
         c &= c - 1;
-        let o = ((open >> s) & 1) as usize;
-        // close bit at e-1; for an empty field (e == s) the shift index would be s-1: guard via (e > s) as mask
-        let nonempty = (e > s) as usize;
-        let cl = ((close >> ((e.wrapping_sub(1)) & 127)) & 1) as usize & nonempty;
-        bad |= (o ^ cl) as u32;
-        let fs = s + o;
-        let fe = e - o;
-        // fe >= fs is guaranteed when o == cl (quoted fields have length >= 2 because open & close == 0)
-        out[k] = unsafe { line.get_unchecked(fs..fe.max(fs)) };
+        let ne = (e > s) as u32;
+        let o = (ob & ne) as usize;
+        ob >>= ne;
+        out[k] = unsafe { line.get_unchecked(s + o..e - o) };
         s = e + 1;
     }
-    bad == 0
+    true
+}
+
+/// Parallel bit extract over 128 bits: hardware `pext` on x86-64 with BMI2, software elsewhere.
+#[inline(always)]
+fn pext128(x: u128, m: u128) -> u128 {
+    let lo = pext64(x as u64, m as u64);
+    let hi = pext64((x >> 64) as u64, (m >> 64) as u64);
+    let nlo = (m as u64).count_ones();
+    (lo as u128) | ((hi as u128) << nlo)
+}
+
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        return unsafe { std::arch::x86_64::_pext_u64(x, m) };
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = m;
+        let mut r = 0u64;
+        let mut k = 0;
+        while m != 0 {
+            let b = m & m.wrapping_neg();
+            r |= ((x & b != 0) as u64) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        r
+    }
 }
 
 /// Line scanner that finds the newline with the same SIMD pass that produces the comma/quote masks.
@@ -413,6 +446,57 @@ mod tests {
                 assert_eq!(g.2, f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
             }
         }
+    }
+
+    #[test]
+    fn structured_quoted_lines() {
+        let mut y: u64 = 0x9e37_79b9_7f4a_7c15;
+        let (mut nv, mut nb) = (0, 0);
+        for _ in 0..200000 {
+            let mut line = Vec::new();
+            for k in 0..7 {
+                if k > 0 {
+                    line.push(b',');
+                }
+                y ^= y << 13;
+                y ^= y >> 7;
+                y ^= y << 17;
+                let len = (y % 21) as usize;
+                let kind = (y >> 8) % 10;
+                let body: Vec<u8> = (0..len).map(|i| b'a' + ((y >> (i % 50)) % 26) as u8).collect();
+                match kind {
+                    0..=4 => line.extend_from_slice(&body),
+                    5..=7 => {
+                        line.push(b'"');
+                        line.extend_from_slice(&body);
+                        line.push(b'"');
+                    }
+                    8 => {
+                        line.push(b'"');
+                        line.extend_from_slice(&body);
+                    }
+                    _ => {
+                        let mut b = body.clone();
+                        if !b.is_empty() {
+                            b[len / 2] = b'"';
+                        }
+                        line.extend_from_slice(&b);
+                    }
+                }
+            }
+            if line.len() >= 128 {
+                continue;
+            }
+            let (ra, a, rb, b) = both::<7>(&line);
+            assert_eq!(ra, rb, "{:?}", String::from_utf8_lossy(&line));
+            if ra {
+                assert_eq!(a, b, "{:?}", String::from_utf8_lossy(&line));
+                nv += 1;
+            } else {
+                nb += 1;
+            }
+        }
+        assert!(nv > 10000 && nb > 10000);
     }
 
     #[test]
