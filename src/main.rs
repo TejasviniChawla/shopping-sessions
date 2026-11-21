@@ -38,31 +38,28 @@ struct EvRaw {
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 product nonempty, bit3 price ok, bits4-5 etype
 }
 
+/// price (24 bits) | category (7 bits) << 24 | purchase (1 bit) << 31
+#[inline(always)]
+fn pack_ev(price: u32, cat: u16, purchase: bool) -> u32 {
+    price | ((cat as u32) << 24) | ((purchase as u32) << 31)
+}
+
 #[derive(Clone, Copy, Default)]
 struct EvValid {
     user: PKey,
     ts: u32,
-    price: u32,
-    cat: u16,
-    etype: u8,
+    packed: u32,
 }
 
 #[derive(Clone, Copy, Default)]
 struct EvMid {
     ts: u32,
     uid: u32,
-    price: u32,
-    cat: u16,
-    etype: u8,
+    packed: u32,
 }
 
-#[derive(Clone, Copy, Default)]
-struct EvFinal {
-    ts: u32,
-    price: u32,
-    cat: u16,
-    etype: u8,
-}
+/// ts (u32 ms offset) << 32 | packed: sorting the u64 sorts by ts.
+type EvFinal = u64;
 
 #[derive(Clone, Copy, Default)]
 struct ClRaw {
@@ -413,7 +410,7 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
             let h = r.id.hash(sides);
             if sk.count(h) < 2 {
                 if event_ok(r) {
-                    out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype: r.flags >> 4 });
+                    out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
                 }
                 continue;
             }
@@ -455,7 +452,7 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
         }
         let r = &raws[t][p][i];
         if event_ok(r) {
-            out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype: r.flags >> 4 });
+            out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
         }
     }
     let o = out.finish();
@@ -618,7 +615,7 @@ fn intern_partition(
     for v in evv {
         for e in v[q].iter() {
             let uid = table.insert(e.user, sides);
-            events.push(EvMid { ts: e.ts, uid, price: e.price, cat: e.cat, etype: e.etype });
+            events.push(EvMid { ts: e.ts, uid, packed: e.packed });
         }
     }
     let mut clicks: HugeVec<ClMid> = HugeVec::with_capacity(ncl);
@@ -714,7 +711,7 @@ impl<'a> Walker<'a> {
         let mut cur_day = i64::MIN;
         let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0i64);
         while i < ev.len() {
-            let start = ws + ev[i].ts as i64;
+            let start = ws + (ev[i] >> 32) as i64;
             let day = start.div_euclid(DAY);
             if day != cur_day {
                 if cur_day != i64::MIN {
@@ -729,18 +726,20 @@ impl<'a> Walker<'a> {
             let mut rev = 0i64;
             let mut purch = false;
             loop {
-                let e = &ev[j];
-                if e.etype == 2 {
+                let e = ev[j] as u32;
+                if (e >> 31) != 0 {
                     purch = true;
-                    rev += e.price as i64;
-                    let c = e.cat as usize;
+                    let price = (e & 0x00FF_FFFF) as i64;
+                    let cat = ((e >> 24) & 0x7F) as u16;
+                    rev += price;
+                    let c = cat as usize;
                     if self.cat_sum[c] == 0 {
-                        self.touched.push(e.cat);
+                        self.touched.push(cat);
                     }
-                    self.cat_sum[c] += e.price as i64;
+                    self.cat_sum[c] += price;
                 }
                 j += 1;
-                if j >= ev.len() || (ev[j].ts as i64 - ev[j - 1].ts as i64) > SESSION_GAP {
+                if j >= ev.len() || ((ev[j] >> 32) as i64 - (ev[j - 1] >> 32) as i64) > SESSION_GAP {
                     break;
                 }
             }
@@ -938,6 +937,7 @@ fn run() {
         products.insert(pid, cid);
     }
     let ncat = cat_names.len() as u16;
+    assert!(ncat < 127, "more than 126 categories: widen pack_ev");
     cat_names.push(b"unknown".to_vec());
     let mut order: Vec<usize> = (0..cat_names.len()).collect();
     order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
@@ -1146,7 +1146,7 @@ fn run() {
         &base,
         |q| &parts[q].events[..],
         |e| e.uid,
-        |e| EvFinal { ts: e.ts, price: e.price, cat: e.cat, etype: e.etype },
+        |e| ((e.ts as u64) << 32) | e.packed as u64,
     );
     let (cl_final, cl_start) = scatter_by_person(
         &ctx,
@@ -1193,7 +1193,7 @@ fn run() {
                         let (cs, ce) = (cl_start[p] as usize, cl_start[p + 1] as usize);
                         let ev = unsafe { std::slice::from_raw_parts_mut(evp.p().add(es), ee - es) };
                         let cl = unsafe { std::slice::from_raw_parts_mut(clp.p().add(cs), ce - cs) };
-                        ev.sort_unstable_by_key(|e| e.ts);
+                        ev.sort_unstable();
                         cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, sides)));
                         w.walk(p as u32, ev, cl);
                     }
