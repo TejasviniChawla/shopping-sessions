@@ -75,20 +75,43 @@ struct ClRaw {
 }
 
 /// A validated click routed to its person partition.
+/// A validated click routed to its person partition. `lex` orders packed click ids like their bytes;
+/// u64::MAX marks a non-packable id that must be compared by bytes.
 #[derive(Clone, Copy, Default)]
 struct CRec {
     pkey: u64,
     id: PKey,
+    lex: u64,
     ts: u32,
     camp: u16,
-    _pad: [u8; 10],
+    _pad: [u8; 2],
 }
 
 #[derive(Clone, Copy, Default)]
 struct ClFinal {
     id: PKey,
+    lex: u64,
     ts: u32,
     camp: u16,
+}
+
+#[inline(always)]
+fn click_lex(id: PKey) -> u64 {
+    if id.is_packed() { id.lex_key() } else { u64::MAX }
+}
+
+#[inline(always)]
+fn click_order(a: &ClFinal, b: &ClFinal) -> std::cmp::Ordering {
+    match a.ts.cmp(&b.ts) {
+        std::cmp::Ordering::Equal => {
+            if a.lex != u64::MAX && b.lex != u64::MAX {
+                a.lex.cmp(&b.lex)
+            } else {
+                a.id.cmp_bytes(&b.id)
+            }
+        }
+        o => o,
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -591,7 +614,7 @@ fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
                 };
                 if fresh && (rec.flags & 7) == 7 {
                     let pk = person_key(rec.user, lm);
-                    out.push(part(PKey(pk).hash(), log_p), CRec { pkey: pk, id: rec.id, ts: rec.ts, camp: rec.camp, _pad: [0; 10] });
+                    out.push(part(PKey(pk).hash(), log_p), CRec { pkey: pk, id: rec.id, lex: click_lex(rec.id), ts: rec.ts, camp: rec.camp, _pad: [0; 2] });
                 }
             }
         }
@@ -930,7 +953,7 @@ fn person_partition(
                 k += 1;
                 let d = cpos[l];
                 cpos[l] += 1;
-                cl_sorted[d as usize] = ClFinal { id: r.id, ts: r.ts, camp: r.camp };
+                cl_sorted[d as usize] = ClFinal { id: r.id, lex: r.lex, ts: r.ts, camp: r.camp };
             }
         }
     }
@@ -950,7 +973,7 @@ fn person_partition(
             ev.sort_unstable();
         }
         let cl = &mut cl_sorted[cs..ce];
-        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id)));
+        cl.sort_unstable_by(click_order);
         w.walk(ids.keys[l], ev, cl);
     }
 }
