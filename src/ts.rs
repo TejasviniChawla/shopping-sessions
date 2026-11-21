@@ -165,6 +165,15 @@ pub fn parse_f1_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
 #[inline(always)]
 pub fn parse_ts_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
     let n = s.len();
+    if n == 13 {
+        // common F3 case inlined here: 13 digits = two overlapping 8-digit words
+        let w0 = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+        let w1 = u64::from_le_bytes([s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]]);
+        if is_digits8(w0) && is_digits8(w1) {
+            return Some((parse8(w0) * 100_000 + parse8(w1) % 100_000) as i64);
+        }
+        return parse_ts(s);
+    }
     if n == 20 {
         if s[19] != b'Z' {
             return None;
