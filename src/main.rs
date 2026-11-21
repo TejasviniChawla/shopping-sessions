@@ -359,10 +359,18 @@ fn event_ok(r: &EvRaw) -> bool {
     (r.flags & 7) == 7 && etype < 3 && (etype != 2 || (r.flags & 8) != 0) && (r.ingest as i64) * 1000 - (r.ts as i64) <= LATE
 }
 
+static DEDUP_NS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 /// Per partition p: dedup event copies by event_id keeping min ingest, validate, scatter by user hash.
 fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<HugeVec<EvValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     const D: usize = 16;
+    let tp = Instant::now();
     // pass 1: count sketch
     let mut sk = Sketch::new(total);
     for tv in raws.iter() {
@@ -378,6 +386,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
             sk.bump(recs[i].id.hash(sides));
         }
     }
+    DEDUP_NS[0].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let tp = Instant::now();
     // pass 2: unique keys are winners; candidates go through an exact table (min ingest wins)
     let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
     let mut cands: Vec<u32> = Vec::with_capacity(total / 8 + 64);
@@ -425,6 +435,9 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
             }
         }
     }
+    DEDUP_NS[1].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    DEDUP_NS[3].fetch_add(cands.len() as u64, Ordering::Relaxed);
+    let tp = Instant::now();
     // pass 3: candidate winners
     for &packed in &cands {
         let t = (packed >> 27) as usize;
@@ -438,7 +451,9 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
             out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype: r.flags >> 4 });
         }
     }
-    out.finish()
+    let o = out.finish();
+    DEDUP_NS[2].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    o
 }
 
 fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
@@ -788,13 +803,16 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
     // split + timestamps only
     let t = Instant::now();
     let mut acc = 0i64;
+    let mut dc = Side::new();
     for &u in units {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
         let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
         while let Some((l, m)) = sc.next() {
             let mut f = [&b""[..]; 7];
             if split_scanned(l, m, &mut f) {
-                acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0)).wrapping_add(parse_f1(f[3]).unwrap_or(0));
+                acc = acc
+                    .wrapping_add(parse_ts_cached(f[2], &mut dc.dates).unwrap_or(0))
+                    .wrapping_add(parse_f1_cached(f[3], &mut dc.dates).unwrap_or(0));
             }
         }
     }
@@ -991,7 +1009,16 @@ fn run() {
     drop(cl_raw);
     let evv: Vec<Vec<HugeVec<EvValid>>> = evv.into_iter().map(|x| x.unwrap()).collect();
     let clv: Vec<Vec<HugeVec<ClValid>>> = clv.into_iter().map(|x| x.unwrap()).collect();
-    log(&t0, "dedup+validate done");
+    log(
+        &t0,
+        &format!(
+            "dedup+validate done (thread-seconds: sketch {:.3}, pass2 {:.3}, pass3 {:.3}; candidates {})",
+            DEDUP_NS[0].load(Ordering::Relaxed) as f64 / 1e9,
+            DEDUP_NS[1].load(Ordering::Relaxed) as f64 / 1e9,
+            DEDUP_NS[2].load(Ordering::Relaxed) as f64 / 1e9,
+            DEDUP_NS[3].load(Ordering::Relaxed)
+        ),
+    );
 
     // Phase 3: intern users per partition
     let next = AtomicUsize::new(0);

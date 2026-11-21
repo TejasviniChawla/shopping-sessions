@@ -58,10 +58,40 @@ unsafe fn masks128(p: *const u8) -> (u128, u128) {
     (c, q)
 }
 
+/// AVX-512BW: two 64-byte compares per character class, masks come out as u64 directly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn masks3_avx512(p: *const u8) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    let nl = _mm512_set1_epi8(b'\n' as i8);
+    let v0 = _mm512_loadu_si512(p as *const _);
+    let v1 = _mm512_loadu_si512(p.add(64) as *const _);
+    let c = (_mm512_cmpeq_epi8_mask(v0, comma) as u128) | ((_mm512_cmpeq_epi8_mask(v1, comma) as u128) << 64);
+    let q = (_mm512_cmpeq_epi8_mask(v0, quote) as u128) | ((_mm512_cmpeq_epi8_mask(v1, quote) as u128) << 64);
+    let n = (_mm512_cmpeq_epi8_mask(v0, nl) as u128) | ((_mm512_cmpeq_epi8_mask(v1, nl) as u128) << 64);
+    (c, q, n)
+}
+
 /// Comma, quote and newline bitmasks over the first 128 bytes at `p`.
 #[inline(always)]
 #[allow(unused_unsafe)]
 pub unsafe fn masks3(p: *const u8) -> (u128, u128, u128) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // detected once; the macro caches, but keep the hot path to one relaxed load + predictable branch
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static USE512: AtomicU8 = AtomicU8::new(0);
+        let mut f = USE512.load(Ordering::Relaxed);
+        if f == 0 {
+            f = if std::env::var_os("NO_AVX512").is_none() && is_x86_feature_detected!("avx512bw") { 2 } else { 1 };
+            USE512.store(f, Ordering::Relaxed);
+        }
+        if f == 2 {
+            return masks3_avx512(p);
+        }
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use std::arch::x86_64::*;
