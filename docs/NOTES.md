@@ -61,3 +61,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 00:10: Linux VM (Docker Desktop arm64, 4 GB) with bind-mounted data: dev MATCH with fork wrapper (exit 0), but
   timings dominated by virtiofs reads (782 MB in 4-10 s). Re-testing with data copied into a docker volume.
   SWAR 13-digit F3 parse added (tests pass, fixtures 36/36, dev MATCH).
+- 2026-11-21 00:30: Linux VM with data in a docker volume (THP=always): 10M in 2.5-3.2 s in-container (parse 0.8, dedup 0.7-1.4!),
+  docker run overhead ~0.35 s. VM shares cores with host, 4 GB total: directional only.
+  Plan: PKey = u64 packed ID (base-37 over [0-9a-z], <=12 chars; else fallback index into per-thread side table of Key).
+  Record sizes: EvRaw 48->32, ClRaw 40->24, EvValid 32->24, EvMid 24->16, EvFinal 24->12, ClFinal 24->16.
