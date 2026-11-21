@@ -129,3 +129,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~09:30 ET: PGO Docker build works (traced pgo.sh; "PGO build ok" ~23 s extra). A/B vs plain 4a83518 pending.
   mmap input (fault-around) neutral vs pread: not adopted. Heavy-first scheduling + mirror skip: ~1% (4325cc0 lineage).
   CI idle: parse 1%, dedup 1%, walk 5-10% after the fix.
+- 2026-11-22 ~10:30 ET: PGO A/B vs plain 4a83518 on one runner: 0.806-0.813 vs 0.839-0.861 (-5%). 3M vs 1M training: identical.
+  Recommended: 2bf102e (or 1627d27, equivalent). Plateau of this architecture on Zen4-4vCPU-10M ~0.80 s in-container.
+  Dropped ideas: stamp-value cache (shuffled input, 1.2M distinct seconds -> no locality), 28-byte raw records (~1%).
