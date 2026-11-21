@@ -346,6 +346,15 @@ fn pack8(s: &[u8]) -> Option<u64> {
 }
 
 const POW37_8: u64 = 3_512_479_453_921; // 37^8
+const POW37: [u64; 13] = {
+    let mut t = [1u64; 13];
+    let mut i = 1;
+    while i < 13 {
+        t[i] = t[i - 1] * 37;
+        i += 1;
+    }
+    t
+};
 
 impl PKey {
     #[inline(always)]
@@ -450,8 +459,26 @@ impl PKey {
             k.bytes_from(&sides[aid].arena)
         }
     }
+    /// For packed keys: a u64 whose numeric order equals the byte-lexicographic order of the ID.
+    /// Left-align the base-37 digits to 12 places (pad with digit 0, which sorts before every real digit).
+    #[inline(always)]
+    pub fn lex_key(&self) -> u64 {
+        debug_assert!(self.is_packed());
+        let v = self.0;
+        // number of digits = count of powers <= v
+        let mut n = 0u32;
+        let mut p: u64 = 1;
+        for _ in 0..12 {
+            n += (v >= p) as u32;
+            p = p.saturating_mul(37);
+        }
+        v * POW37[(12 - n) as usize]
+    }
     #[inline]
     pub fn cmp_bytes(&self, other: &PKey, sides: &Sides) -> std::cmp::Ordering {
+        if self.is_packed() && other.is_packed() {
+            return self.lex_key().cmp(&other.lex_key());
+        }
         let (mut ba, mut bb) = ([0u8; 12], [0u8; 12]);
         self.bytes(sides, &mut ba).cmp(other.bytes(sides, &mut bb))
     }

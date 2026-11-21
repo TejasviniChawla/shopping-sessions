@@ -941,28 +941,51 @@ fn run() {
     let n_ids = base[P] as usize;
     log(&t0, &format!("interned {} user ids", n_ids));
 
-    // Phase 3b: union-find over links
-    let mut parent: Vec<u32> = (0..n_ids as u32).collect();
-    for t in &links {
-        for lp in t {
-            for l in lp.iter() {
-                let qa = part(l.a.hash(sides));
-                let qb = part(l.b.hash(sides));
-                let ua = base[qa] + parts[qa].table.lookup(&l.a, sides).expect("link a");
-                let ub = base[qb] + parts[qb].table.lookup(&l.b, sides).expect("link b");
-                let ra = find(&mut parent, ua);
-                let rb = find(&mut parent, ub);
-                if ra != rb {
-                    if ra < rb {
-                        parent[rb as usize] = ra;
-                    } else {
-                        parent[ra as usize] = rb;
+    // Phase 3b: resolve link endpoints in parallel (read-only tables), then a sequential union-find
+    let edges: Vec<Vec<(u32, u32)>> = {
+        let next = AtomicUsize::new(0);
+        let mut es: Vec<Option<Vec<(u32, u32)>>> = (0..P).map(|_| None).collect();
+        let ep = Shared(es.as_mut_ptr());
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                let next = &next;
+                let (links, parts, base) = (&links, &parts, &base);
+                s.spawn(move || loop {
+                    let q = next.fetch_add(1, Ordering::Relaxed);
+                    if q >= P {
+                        break;
                     }
+                    let mut v = Vec::new();
+                    for t in links.iter() {
+                        for l in t[q].iter() {
+                            let qb = part(l.b.hash(sides));
+                            let ua = base[q] + parts[q].table.lookup(&l.a, sides).expect("link a");
+                            let ub = base[qb] + parts[qb].table.lookup(&l.b, sides).expect("link b");
+                            v.push((ua, ub));
+                        }
+                    }
+                    unsafe { *ep.p().add(q) = Some(v) };
+                });
+            }
+        });
+        es.into_iter().map(|x| x.unwrap()).collect()
+    };
+    drop(links);
+    let mut parent: Vec<u32> = (0..n_ids as u32).collect();
+    for v in &edges {
+        for &(ua, ub) in v {
+            let ra = find(&mut parent, ua);
+            let rb = find(&mut parent, ub);
+            if ra != rb {
+                if ra < rb {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
                 }
             }
         }
     }
-    drop(links);
+    drop(edges);
     let mut id_key: Vec<PKey> = Vec::with_capacity(n_ids);
     for q in 0..P {
         id_key.extend_from_slice(&parts[q].table.keys);

@@ -30,16 +30,19 @@ jobs:
       - name: Run 3 times (fork on)
         run: |
           for i in 1 2 3; do
-            rm -rf /tmp/out/*
+            sudo rm -rf /tmp/out/*
             /usr/bin/time -f "wall %e s, maxrss %M KB" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m \
               --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 4 --memory 12g --memory-swap 12g \
               --user 1000:1000 -v /tmp/data:/data:ro -v /tmp/out:/output -v /tmp/scratch:/scratch \
               -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=4 -e MEM_GB=12 shopsess:ci
           done
-      - name: Run once with NO_FORK and NCPU=8 (hyperthread-style oversubscription)
+      - name: Run with NCPU=8 (oversubscribed) and with NO_FORK
         run: |
-          rm -rf /tmp/out/*
+          sudo rm -rf /tmp/out/*
           /usr/bin/time -f "wall %e s" docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
-            -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NO_FORK=1 -e NCPU=8 shopsess:ci
+            -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=8 shopsess:ci
+          sudo rm -rf /tmp/out/*
+          /usr/bin/time -f "wall %e s" docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
+            -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NO_FORK=1 -e NCPU=4 shopsess:ci
       - name: Empty-container baseline
         run: /usr/bin/time -f "docker run overhead %e s" docker run --rm --network none alpine true

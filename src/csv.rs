@@ -188,7 +188,8 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
         out[N - 1] = &line[s..n];
         return true;
     }
-    // quotes: a quote is valid only as the first and last byte of a field of length >= 2
+    // quotes: a quote is valid only as the first and last byte of a field of length >= 2.
+    // Branchless per field: start += open, end -= open, and a mismatch between open and close marks the line bad.
     let starts = (cm << 1) | 1;
     let ends = (cm >> 1) | (1u128 << (n - 1));
     let open = qm & starts;
@@ -198,18 +199,22 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
     }
     let mut s = 0usize;
     let mut c = cm | (1u128 << n);
+    let mut bad = 0u32;
     for k in 0..N {
         let e = c.trailing_zeros() as usize;
         c &= c - 1;
-        let o = (open >> s) & 1 == 1;
-        let cl = e > s && (close >> (e - 1)) & 1 == 1;
-        if o != cl {
-            return false;
-        }
-        out[k] = if o { &line[s + 1..e - 1] } else { &line[s..e] };
+        let o = ((open >> s) & 1) as usize;
+        // close bit at e-1; for an empty field (e == s) the shift index would be s-1: guard via (e > s) as mask
+        let nonempty = (e > s) as usize;
+        let cl = ((close >> ((e.wrapping_sub(1)) & 127)) & 1) as usize & nonempty;
+        bad |= (o ^ cl) as u32;
+        let fs = s + o;
+        let fe = e - o;
+        // fe >= fs is guaranteed when o == cl (quoted fields have length >= 2 because open & close == 0)
+        out[k] = unsafe { line.get_unchecked(fs..fe.max(fs)) };
         s = e + 1;
     }
-    true
+    bad == 0
 }
 
 /// Line scanner that finds the newline with the same SIMD pass that produces the comma/quote masks.
