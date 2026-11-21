@@ -1204,21 +1204,26 @@ fn run() {
                     let mut pout: ChunkScatter<PRec> = ChunkScatter::new(ev_pool, np);
                     let mut cout: ChunkScatter<Copy_> = ChunkScatter::new(cp_pool, np);
                     const D: usize = 16;
-                    let mut ring: [EvRaw; D] = [EvRaw::default(); D];
-                    let mut n = 0usize;
+                    let no_lookup = std::env::var_os("NO_LOOKUP").is_some();
+                    let no_copy = std::env::var_os("NO_COPY").is_some();
+                    let ring_mode = std::env::var_os("RING").is_some();
                     macro_rules! emit {
                         ($r:expr) => {{
                             let r: &EvRaw = $r;
-                            let uh = r.user.hash();
-                            let person = lm.get(r.user.0, uh).unwrap_or(r.user.0);
+                            let person = if no_lookup { r.user.0 } else { lm.get(r.user.0, r.user.hash()).unwrap_or(r.user.0) };
                             let at = if event_ok(r) {
                                 pout.push(part(PKey(person).hash(), log_p), PRec { pkey: person, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) })
                             } else {
                                 NO_EVENT
                             };
-                            cout.push(part(r.id.hash(), log_p), Copy_ { eid: r.id.0, ingest: r.ingest, at });
+                            if !no_copy {
+                                cout.push(part(r.id.hash(), log_p), Copy_ { eid: r.id.0, ingest: r.ingest, at });
+                            }
                         }};
                     }
+                    let mut ring: [EvRaw; D] = [EvRaw::default(); D];
+                    let mut n = 0usize;
+                    let mut raws: Vec<EvRaw> = Vec::with_capacity(1 << 15);
                     loop {
                         let i = next_e.fetch_add(1, Ordering::Relaxed);
                         if i >= inputs.events.len() {
@@ -1231,17 +1236,39 @@ fn run() {
                         let (lo, hi) = (buf.lo, buf.hi);
                         let data = buf.data();
                         let mut sc = Scanner::new(data, lo, hi);
-                        while let Some((line, masks)) = sc.next() {
-                            if let Some(r) = parse_event_line(ctx, &mut side, line, masks) {
-                                lm.prefetch(r.user.hash());
-                                if n >= D {
-                                    emit!(&ring[n % D]);
+                        if ring_mode {
+                            while let Some((line, masks)) = sc.next() {
+                                if let Some(r) = parse_event_line(ctx, &mut side, line, masks) {
+                                    lm.prefetch(r.user.hash());
+                                    if n >= D {
+                                        emit!(&ring[n % D]);
+                                    }
+                                    ring[n % D] = r;
+                                    n += 1;
                                 }
-                                ring[n % D] = r;
-                                n += 1;
                             }
+                            tick(timing, &T_PARSE[1], &mut tm);
+                        } else {
+                            // two passes per unit: parse into an L2-resident vector, then resolve and scatter
+                            raws.clear();
+                            while let Some((line, masks)) = sc.next() {
+                                if let Some(r) = parse_event_line(ctx, &mut side, line, masks) {
+                                    raws.push(r);
+                                }
+                            }
+                            tick(timing, &T_PARSE[1], &mut tm);
+                            let m = raws.len();
+                            for r in raws.iter().take(D) {
+                                lm.prefetch(r.user.hash());
+                            }
+                            for k in 0..m {
+                                if k + D < m {
+                                    lm.prefetch(raws[k + D].user.hash());
+                                }
+                                emit!(&raws[k]);
+                            }
+                            tick(timing, &T_PARSE[2], &mut tm);
                         }
-                        tick(timing, &T_PARSE[1], &mut tm);
                     }
                     for i in n.saturating_sub(D)..n {
                         emit!(&ring[i % D]);
@@ -1376,8 +1403,8 @@ fn run() {
     if timing {
         let g = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
-            "    thread-seconds: event pread {:.3}, event scan+parse {:.3}; dedup filter {:.3}, gather {:.3}, resolve {:.3}; person ids {:.3}, counting sort {:.3}, sorts {:.3}, walk {:.3}",
-            g(&T_PARSE[0]), g(&T_PARSE[1]), g(&T_DEDUP[0]), g(&T_DEDUP[1]), g(&T_DEDUP[2]), g(&T_PERSON[0]), g(&T_PERSON[1]), g(&T_PERSON[2]), g(&T_PERSON[3])
+            "    thread-seconds: event pread {:.3}, event scan+parse {:.3}, resolve+scatter {:.3}; dedup filter {:.3}, gather {:.3}, resolve {:.3}; person ids {:.3}, counting sort {:.3}, sorts {:.3}, walk {:.3}",
+            g(&T_PARSE[0]), g(&T_PARSE[1]), g(&T_PARSE[2]), g(&T_DEDUP[0]), g(&T_DEDUP[1]), g(&T_DEDUP[2]), g(&T_PERSON[0]), g(&T_PERSON[1]), g(&T_PERSON[2]), g(&T_PERSON[3])
         );
     }
 
