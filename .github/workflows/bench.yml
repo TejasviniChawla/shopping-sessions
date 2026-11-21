@@ -1,0 +1,45 @@
+# Times the container on an x86-64 Linux runner: builds the image, generates a dataset, runs with the scorer's flags.
+name: bench
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: number of events to generate
+        default: "10000000"
+      seed:
+        description: generator seed
+        default: "7"
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU info
+        run: lscpu | head -20; nproc; free -g; cat /sys/kernel/mm/transparent_hugepage/enabled
+      - name: Build image
+        run: docker build -t shopsess:ci .
+      - name: Build generator
+        run: cd tools/generator && cargo build --release
+      - name: Generate data
+        run: |
+          mkdir -p /tmp/data /tmp/out /tmp/scratch && chmod 777 /tmp/out /tmp/scratch
+          tools/generator/target/release/generate --seed ${{ github.event.inputs.seed }} --events ${{ github.event.inputs.events }} --clicks $(( ${{ github.event.inputs.events }} / 4 )) --output /tmp/data
+          du -sh /tmp/data
+      - name: Warm page cache
+        run: cat /tmp/data/events/*.csv /tmp/data/clicks/*.csv /tmp/data/links/*.csv > /dev/null
+      - name: Run 3 times (fork on)
+        run: |
+          for i in 1 2 3; do
+            rm -rf /tmp/out/*
+            /usr/bin/time -f "wall %e s, maxrss %M KB" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m \
+              --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 4 --memory 12g --memory-swap 12g \
+              --user 1000:1000 -v /tmp/data:/data:ro -v /tmp/out:/output -v /tmp/scratch:/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=4 -e MEM_GB=12 shopsess:ci
+          done
+      - name: Run once with NO_FORK and NCPU=8 (hyperthread-style oversubscription)
+        run: |
+          rm -rf /tmp/out/*
+          /usr/bin/time -f "wall %e s" docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
+            -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NO_FORK=1 -e NCPU=8 shopsess:ci
+      - name: Empty-container baseline
+        run: /usr/bin/time -f "docker run overhead %e s" docker run --rm --network none alpine true
