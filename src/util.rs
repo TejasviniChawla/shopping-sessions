@@ -184,6 +184,7 @@ pub struct HugeVec<T> {
     ptr: *mut T,
     len: usize,
     cap: usize,
+    bytes: usize,
 }
 unsafe impl<T: Send> Send for HugeVec<T> {}
 unsafe impl<T: Sync> Sync for HugeVec<T> {}
@@ -201,7 +202,35 @@ fn populate() -> libc::c_int {
     0
 }
 
+/// Pool of released mappings: later phases reuse already-faulted memory instead of unmapping and re-faulting.
+static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn pool_take(bytes: usize) -> Option<*mut u8> {
+    if std::env::var_os("NO_POOL").is_some() {
+        return None;
+    }
+    let mut pool = POOL.lock().unwrap();
+    // best fit: smallest mapping that is large enough
+    let mut best: Option<usize> = None;
+    for (i, &(_, b)) in pool.iter().enumerate() {
+        if b >= bytes && best.map_or(true, |j| pool[j].1 > b) {
+            best = Some(i);
+        }
+    }
+    best.map(|i| {
+        let (p, _) = pool.swap_remove(i);
+        p as *mut u8
+    })
+}
+
+fn pool_put(p: *mut u8, bytes: usize) {
+    POOL.lock().unwrap().push((p as usize, bytes));
+}
+
 fn map_bytes(bytes: usize) -> *mut u8 {
+    if let Some(p) = pool_take(bytes) {
+        return p;
+    }
     unsafe {
         // MAP_POPULATE: the kernel maps and zeroes all pages in one go, instead of one trap per page.
         let p = libc::mmap(
@@ -233,7 +262,7 @@ impl<T: Copy> HugeVec<T> {
         let unit = if raw >= HUGE_MIN { HUGE } else { 4096 };
         let bytes = (raw + unit - 1) / unit * unit;
         let ptr = map_bytes(bytes) as *mut T;
-        HugeVec { ptr, len: 0, cap: bytes / size }
+        HugeVec { ptr, len: 0, cap: bytes / size, bytes }
     }
     /// Allocates and marks `n` elements as present without initializing them; the caller writes every one.
     pub fn with_len_uninit(n: usize) -> Self {
@@ -258,10 +287,11 @@ impl<T: Copy> HugeVec<T> {
         let np = map_bytes(new_bytes) as *mut T;
         unsafe {
             std::ptr::copy_nonoverlapping(self.ptr, np, self.len);
-            libc::munmap(self.ptr as *mut libc::c_void, self.cap * size);
         }
+        pool_put(self.ptr as *mut u8, self.bytes);
         self.ptr = np;
         self.cap = new_bytes / size;
+        self.bytes = new_bytes;
     }
     #[inline(always)]
     pub fn as_mut_ptr(&mut self) -> *mut T {
@@ -331,10 +361,7 @@ impl<T> std::ops::DerefMut for HugeVec<T> {
 }
 impl<T> Drop for HugeVec<T> {
     fn drop(&mut self) {
-        let size = std::mem::size_of::<T>().max(1);
-        unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.cap * size);
-        }
+        pool_put(self.ptr as *mut u8, self.bytes);
     }
 }
 

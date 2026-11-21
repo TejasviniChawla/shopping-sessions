@@ -12,6 +12,9 @@ on:
       compare:
         description: optional second commit to build and time on the same runner
         default: ""
+      envs:
+        description: semicolon-separated env settings, each run natively under perf stat
+        default: ""
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -93,5 +96,16 @@ jobs:
           rm -rf /tmp/out2; mkdir -p /tmp/out2
           DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf record -q -F 2000 -g -o /tmp/perf.data /tmp/shopsess 2>/dev/null || true
           perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -vE "^#|^$" | head -40 || true
+      - name: Env experiments (native, perf stat)
+        if: ${{ github.event.inputs.envs != '' }}
+        run: |
+          IFS=';' read -ra SETS <<< "${{ github.event.inputs.envs }}"
+          for e in "" "${SETS[@]}"; do
+            for i in 1 2; do
+              rm -rf /tmp/out2; mkdir -p /tmp/out2
+              echo "=== env [$e] run $i ==="
+              env $e DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf stat -e task-clock,page-faults /tmp/shopsess 2>&1 | grep -E "wrote|page-faults|seconds (user|sys|time)"
+            done
+          done
       - name: Empty-container baseline
         run: /usr/bin/time -f "docker run overhead %e s" docker run --rm --network none alpine true
