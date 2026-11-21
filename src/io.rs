@@ -1,15 +1,29 @@
-//! Input discovery, mmapping, and splitting files into newline-aligned work units.
+//! Input discovery and fixed-size byte-range work units read with pread into per-thread padded buffers.
+//! A line belongs to the unit holding its first byte; a unit reads a tail past its end to finish its last line.
 
-use memmap2::Mmap;
 use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+pub const UNIT: usize = 2 << 20;
+/// Bytes read past the unit end to complete the last line (grown if a line is longer).
+pub const TAIL: usize = 64 << 10;
+/// Zero padding after the data so SIMD may over-read.
+pub const PAD: usize = 256;
+
+#[derive(Clone, Copy)]
+pub struct Unit {
+    pub file: u32,
+    pub start: u64,
+    pub end: u64,
+}
+
 pub struct Inputs {
-    pub files: Vec<Mmap>,
-    /// Work units: (file index, start, end) with start after the header line; end at a line boundary.
-    pub events: Vec<(usize, usize, usize)>,
-    pub clicks: Vec<(usize, usize, usize)>,
-    pub links: Vec<(usize, usize, usize)>,
+    pub files: Vec<File>,
+    pub sizes: Vec<u64>,
+    pub events: Vec<Unit>,
+    pub clicks: Vec<Unit>,
+    pub links: Vec<Unit>,
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -26,55 +40,119 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-const UNIT: usize = 4 << 20;
-
-/// Opens every CSV in the folder, mmaps it, and appends work units. Header line is skipped.
-fn add_folder(dir: &Path, files: &mut Vec<Mmap>, units: &mut Vec<(usize, usize, usize)>) {
+fn add_folder(dir: &Path, files: &mut Vec<File>, sizes: &mut Vec<u64>, units: &mut Vec<Unit>) {
     for p in list_csv(dir) {
         let f = match File::open(&p) {
             Ok(f) => f,
             Err(_) => continue,
         };
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         if len == 0 {
             continue;
         }
-        let m = unsafe { Mmap::map(&f) }.expect("mmap");
-        #[cfg(target_os = "linux")]
-        let _ = m.advise(memmap2::Advice::Sequential);
-        let idx = files.len();
-        // skip header
-        let hdr_end = match memchr::memchr(b'\n', &m[..]) {
-            Some(k) => k + 1,
-            None => len, // header only, no newline
-        };
-        let mut start = hdr_end;
+        let idx = files.len() as u32;
+        let mut start = 0u64;
         while start < len {
-            let mut end = (start + UNIT).min(len);
-            if end < len {
-                match memchr::memchr(b'\n', &m[end..]) {
-                    Some(k) => end = end + k + 1,
-                    None => end = len,
-                }
-            }
-            units.push((idx, start, end));
+            let end = (start + UNIT as u64).min(len);
+            units.push(Unit { file: idx, start, end });
             start = end;
         }
-        files.push(m);
+        files.push(f);
+        sizes.push(len);
     }
 }
 
 pub fn discover(data: &Path) -> Inputs {
     let mut files = Vec::new();
-    let mut events = Vec::new();
-    let mut clicks = Vec::new();
-    let mut links = Vec::new();
-    add_folder(&data.join("events"), &mut files, &mut events);
-    add_folder(&data.join("clicks"), &mut files, &mut clicks);
-    add_folder(&data.join("links"), &mut files, &mut links);
-    // Largest units first for better load balance.
-    events.sort_by_key(|u| std::cmp::Reverse(u.2 - u.1));
-    clicks.sort_by_key(|u| std::cmp::Reverse(u.2 - u.1));
-    links.sort_by_key(|u| std::cmp::Reverse(u.2 - u.1));
-    Inputs { files, events, clicks, links }
+    let mut sizes = Vec::new();
+    let (mut events, mut clicks, mut links) = (Vec::new(), Vec::new(), Vec::new());
+    add_folder(&data.join("events"), &mut files, &mut sizes, &mut events);
+    add_folder(&data.join("clicks"), &mut files, &mut sizes, &mut clicks);
+    add_folder(&data.join("links"), &mut files, &mut sizes, &mut links);
+    Inputs { files, sizes, events, clicks, links }
+}
+
+/// A reusable read buffer. After `load`, `data()` holds the unit's bytes from `first_line_start`
+/// up to (and including) the newline that ends the last line starting before `end`; PAD zero bytes follow.
+pub struct Buffer {
+    buf: Vec<u8>,
+    /// Index in `buf` where the first line owned by this unit starts.
+    pub lo: usize,
+    /// Index in `buf` one past the last byte of the unit's data (end of last owned line, after its '\n').
+    pub hi: usize,
+}
+
+impl Buffer {
+    pub fn new() -> Self {
+        Buffer { buf: vec![0u8; UNIT + TAIL + PAD + 1], lo: 0, hi: 0 }
+    }
+
+    #[inline(always)]
+    pub fn data(&self) -> &[u8] {
+        &self.buf[..self.hi]
+    }
+
+    pub fn load(&mut self, file: &File, size: u64, u: Unit) {
+        // Read from start-1 so the byte before the unit tells us whether `start` begins a line.
+        let rstart = u.start.saturating_sub(1);
+        let mut want = (u.end + TAIL as u64).min(size) - rstart;
+        loop {
+            let need = want as usize + PAD;
+            if self.buf.len() < need {
+                self.buf.resize(need, 0);
+            }
+            file.read_exact_at(&mut self.buf[..want as usize], rstart).expect("read");
+            // zero the padding
+            for b in &mut self.buf[want as usize..want as usize + PAD] {
+                *b = 0;
+            }
+            let data_len = want as usize;
+            // first owned line start
+            let unit_off = (u.start - rstart) as usize; // 0 or 1
+            let mut lo = if u.start == 0 {
+                // skip header line
+                match memchr::memchr(b'\n', &self.buf[..data_len]) {
+                    Some(k) => k + 1,
+                    None => data_len,
+                }
+            } else if self.buf[0] == b'\n' {
+                unit_off
+            } else {
+                match memchr::memchr(b'\n', &self.buf[unit_off..data_len]) {
+                    Some(k) => unit_off + k + 1,
+                    None => data_len,
+                }
+            };
+            let end_off = (u.end - rstart) as usize;
+            if lo > end_off {
+                lo = end_off;
+            }
+            // find the end of the last line that starts before end_off: first '\n' at or after end_off-1... precisely:
+            // lines starting before end_off; the last such line ends at the first '\n' at index >= end_off-1 if
+            // byte end_off-1 is not itself a '\n' terminating a previous line... simpler: the unit owns all bytes
+            // in [lo, end_off) plus the continuation of the line containing byte end_off-1 (if that byte isn't '\n').
+            let hi;
+            if end_off == 0 || end_off <= lo {
+                hi = lo;
+            } else if self.buf[end_off - 1] == b'\n' {
+                hi = end_off;
+            } else {
+                match memchr::memchr(b'\n', &self.buf[end_off..data_len]) {
+                    Some(k) => hi = end_off + k + 1,
+                    None => {
+                        if rstart + want >= size {
+                            hi = data_len; // last line of the file without trailing newline
+                        } else {
+                            // line longer than TAIL: read more
+                            want = (want * 2).min(size - rstart);
+                            continue;
+                        }
+                    }
+                }
+            }
+            self.lo = lo;
+            self.hi = hi;
+            return;
+        }
+    }
 }

@@ -1,27 +1,4 @@
-//! Byte references into the mmapped input files, hashing, and small open-addressing tables.
-
-use memmap2::Mmap;
-
-/// A slice of one input file: (file index, offset, length). 8 bytes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Ref {
-    pub off: u32,
-    pub file: u16,
-    pub len: u16,
-}
-
-impl Ref {
-    #[inline(always)]
-    pub fn new(file: usize, base: *const u8, s: &[u8]) -> Ref {
-        let off = (s.as_ptr() as usize - base as usize) as u32;
-        Ref { off, file: file as u16, len: s.len() as u16 }
-    }
-    #[inline(always)]
-    pub fn get<'a>(&self, files: &'a [Mmap]) -> &'a [u8] {
-        let f = &files[self.file as usize];
-        &f[self.off as usize..self.off as usize + self.len as usize]
-    }
-}
+//! ID keys, hashing, and small open-addressing tables.
 
 #[inline(always)]
 pub fn hash_bytes(b: &[u8]) -> u64 {
@@ -93,12 +70,12 @@ impl SmallTable {
             i = (i + 1) & self.mask;
         }
     }
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
-/// An ID key: up to 15 bytes stored inline (top byte = length), longer ones as a Ref (top byte 0xFF).
+/// Per-thread byte arenas hold the rare IDs longer than 15 bytes.
+pub type Arenas = [Vec<u8>];
+
+/// An ID key: up to 15 bytes stored inline (top byte = length), longer ones copied into an arena (top byte 0xFF).
 /// Inline keys compare with one u128 equality; nothing after parsing needs the input files again.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
@@ -106,7 +83,7 @@ pub struct Key(u128);
 
 impl Key {
     #[inline(always)]
-    pub fn new(s: &[u8], file: usize, base: *const u8) -> Key {
+    pub fn new(s: &[u8], arena_id: usize, arena: &mut Vec<u8>) -> Key {
         let n = s.len();
         if n <= 15 {
             let mut buf = [0u8; 16];
@@ -114,8 +91,9 @@ impl Key {
             buf[15] = n as u8;
             Key(u128::from_le_bytes(buf))
         } else {
-            let r = Ref::new(file, base, s);
-            let packed = (r.off as u128) | ((r.file as u128) << 32) | ((r.len as u128) << 48);
+            let off = arena.len();
+            arena.extend_from_slice(s);
+            let packed = (off as u128) | ((arena_id as u128) << 32) | ((n as u128) << 48);
             Key(packed | (0xFFu128 << 120))
         }
     }
@@ -124,29 +102,30 @@ impl Key {
         (self.0 >> 120) as u8 != 0xFF
     }
     #[inline(always)]
-    pub fn bytes<'a>(&'a self, files: &'a [Mmap]) -> &'a [u8] {
+    pub fn bytes<'a>(&'a self, arenas: &'a Arenas) -> &'a [u8] {
         let tag = (self.0 >> 120) as u8;
         if tag != 0xFF {
             // little-endian: byte 0 of the u128 is at the lowest address
             unsafe { std::slice::from_raw_parts(self as *const Key as *const u8, tag as usize) }
         } else {
             let off = self.0 as u32 as usize;
-            let file = (self.0 >> 32) as u16 as usize;
-            let len = (self.0 >> 48) as u16 as usize;
-            &files[file][off..off + len]
+            let arena = (self.0 >> 32) as u16 as usize;
+            let len = (self.0 >> 48) as u32 as usize & 0xFFFF_FFFF;
+            let len = len & 0xFFFF_FFFF_FF;
+            &arenas[arena][off..off + len]
         }
     }
     #[inline(always)]
-    pub fn same(&self, other: &Key, files: &[Mmap]) -> bool {
+    pub fn same(&self, other: &Key, arenas: &Arenas) -> bool {
         if self.is_inline() && other.is_inline() {
             self.0 == other.0
         } else {
-            self.bytes(files) == other.bytes(files)
+            self.bytes(arenas) == other.bytes(arenas)
         }
     }
     #[inline(always)]
-    pub fn cmp_bytes(&self, other: &Key, files: &[Mmap]) -> std::cmp::Ordering {
-        self.bytes(files).cmp(other.bytes(files))
+    pub fn cmp_bytes(&self, other: &Key, arenas: &Arenas) -> std::cmp::Ordering {
+        self.bytes(arenas).cmp(other.bytes(arenas))
     }
 }
 
@@ -154,18 +133,27 @@ impl Key {
 mod tests {
     use super::*;
     #[test]
-    fn key_inline() {
-        let f: Vec<Mmap> = Vec::new();
-        let a = Key::new(b"u1", 0, std::ptr::null());
-        let b = Key::new(b"u1", 0, std::ptr::null());
-        let c = Key::new(b"U1", 0, std::ptr::null());
-        let d = Key::new(b"u1 ", 0, std::ptr::null());
-        assert!(a.same(&b, &f));
-        assert!(!a.same(&c, &f));
-        assert!(!a.same(&d, &f));
-        assert_eq!(a.bytes(&f), b"u1");
-        assert_eq!(Key::new(b"", 0, std::ptr::null()).bytes(&f), b"");
-        assert_eq!(Key::new(b"123456789012345", 0, std::ptr::null()).bytes(&f), b"123456789012345");
-        assert_eq!(c.cmp_bytes(&a, &f), std::cmp::Ordering::Less);
+    fn key_inline_and_arena() {
+        let mut arena = Vec::new();
+        let a = Key::new(b"u1", 0, &mut arena);
+        let b = Key::new(b"u1", 0, &mut arena);
+        let c = Key::new(b"U1", 0, &mut arena);
+        let d = Key::new(b"u1 ", 0, &mut arena);
+        let long1 = Key::new(b"this-is-a-long-user-id-0001", 0, &mut arena);
+        let long2 = Key::new(b"this-is-a-long-user-id-0001", 0, &mut arena);
+        let long3 = Key::new(b"this-is-a-long-user-id-0002", 0, &mut arena);
+        let arenas = vec![arena];
+        assert!(a.same(&b, &arenas));
+        assert!(!a.same(&c, &arenas));
+        assert!(!a.same(&d, &arenas));
+        assert!(long1.same(&long2, &arenas));
+        assert!(!long1.same(&long3, &arenas));
+        assert!(!long1.same(&a, &arenas));
+        assert_eq!(long1.bytes(&arenas), b"this-is-a-long-user-id-0001");
+        assert_eq!(a.bytes(&arenas), b"u1");
+        assert_eq!(Key::new(b"", 0, &mut Vec::new()).bytes(&arenas), b"");
+        assert_eq!(Key::new(b"123456789012345", 0, &mut Vec::new()).bytes(&arenas), b"123456789012345");
+        assert_eq!(c.cmp_bytes(&a, &arenas), std::cmp::Ordering::Less);
+        assert_eq!(long1.cmp_bytes(&long3, &arenas), std::cmp::Ordering::Less);
     }
 }

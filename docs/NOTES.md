@@ -44,3 +44,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   Whole run single-thread 9.2 s: dedup 0.9, intern 0.37, group 0.27, walk 0.25, output 0.12.
   Plan: pread into per-thread padded buffers (no mmap faults, safe SIMD over-read), SIMD u128 comma/quote masks per line,
   SWAR F1 timestamp parse, shrink records.
+- 2026-11-20 21:50: pread buffers + SIMD u128 splitter. Dev 1M: 0.13 s (was 0.35). 36/36, MATCH.
+  Bench warm (10.8M lines, 782 MB, 1 thread): read+lines 0.21 | +split 0.57 | +parse 0.78 | +push 1.20 s.
+  Next: 48-byte EvRaw (ts u32 offset, ingest i32 s, hash recomputed from Key), fuse newline search into SIMD pass.
