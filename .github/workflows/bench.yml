@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: CPU info
         run: lscpu | head -20; nproc; free -g; cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Build image
@@ -24,7 +26,6 @@ jobs:
       - name: Build comparison image
         if: ${{ github.event.inputs.compare != '' }}
         run: |
-          git fetch --depth=1 origin ${{ github.event.inputs.compare }}
           rm -rf /tmp/cmp && git worktree add /tmp/cmp ${{ github.event.inputs.compare }}
           docker build -t shopsess:cmp /tmp/cmp
       - name: Build generator
