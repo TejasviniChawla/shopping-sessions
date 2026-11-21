@@ -92,3 +92,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   PLAN (restructure): links parsed first -> global concurrent user table (CAS) + UF -> person ids for link IDs;
   dedup pass 2 does table.get_or_insert(user) -> person id directly -> EvMid{ts,person,packed} per thread + per-thread
   person histograms; drop EvValid scatter, intern phase and separate histogram pass. Expected -0.1..0.15 s on Zen4-4vCPU-10M.
+- 2026-11-21 ~11:00: d200c39 (global lock-free user table, 16B slots; fused dedup/intern/histogram) on Ice Lake 8370C CI:
+  1.37 s in-container (links 0.15 | parse 0.50 | clicks 0.12 | dedup+intern 0.35 | group 0.07 | walk 0.12 | out 0.06).
+  Earlier 8370C runs: 1.58 (first), 1.46-1.51 (P=32 build). Submitted d200c39 as the second practice run.
