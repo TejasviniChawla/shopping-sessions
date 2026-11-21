@@ -8,6 +8,7 @@ memchr = "2"
 arrow-array = "60"
 arrow-schema = "60"
 parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+libc = "0.2.191"
 
 [profile.release]
 opt-level = 3

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
-use util::{hash_bytes, Arenas, Key, SmallTable};
+use util::{key_hash, Arenas, Key, SmallTable};
 
 const LOG_P: u32 = 4;
 const P: usize = 1 << LOG_P;
@@ -31,9 +31,8 @@ fn part(h: u64) -> usize {
 struct EvRaw {
     id: Key,
     user: Key,
-    ts: i64,
-    ingest: i64,
-    hash: u64,
+    ts: u32,     // ms since window_start (valid only when flag bit0)
+    ingest: i32, // whole seconds since window_start
     price: u32,
     cat: u16,
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 product nonempty, bit3 price ok, bits4-5 etype
@@ -70,8 +69,7 @@ struct EvFinal {
 struct ClRaw {
     id: Key,
     user: Key,
-    ts: i64,
-    hash: u64,
+    ts: u32, // ms since window_start - 7 days (valid only when flag bit0)
     camp: u16,
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 campaign known
 }
@@ -211,13 +209,15 @@ fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> 
     if !split_fields(line, &mut f) || f[0].is_empty() {
         return None;
     }
-    let hash = hash_bytes(f[0]);
-    let ingest = parse_f1(f[3]).unwrap_or(i64::MAX);
+    let ingest = match parse_f1(f[3]) {
+        Some(t) => ((t - ctx.ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        None => i32::MAX,
+    };
     let mut flags = 0u8;
     let ts = match parse_ts(f[2]) {
         Some(t) if t >= ctx.ws && t < ctx.we => {
             flags |= 1;
-            t
+            (t - ctx.ws) as u32
         }
         _ => 0,
     };
@@ -247,16 +247,7 @@ fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> 
             }
         }
     }
-    Some(EvRaw {
-        id: Key::new(f[0], aid, arena),
-        user: Key::new(f[1], aid, arena),
-        ts,
-        ingest,
-        hash,
-        price,
-        cat,
-        flags,
-    })
+    Some(EvRaw { id: Key::new(f[0], aid, arena), user: Key::new(f[1], aid, arena), ts, ingest, price, cat, flags })
 }
 
 #[inline(always)]
@@ -265,13 +256,12 @@ fn parse_click_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> 
     if !split_fields(line, &mut f) || f[0].is_empty() {
         return None;
     }
-    let hash = hash_bytes(f[0]);
     let mut flags = 0u8;
     let lo = ctx.ws - REACH;
     let ts = match parse_ts(f[3]) {
         Some(t) if t >= lo && t < ctx.we => {
             flags |= 1;
-            t
+            (t - lo) as u32
         }
         _ => 0,
     };
@@ -283,7 +273,7 @@ fn parse_click_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> 
         flags |= 4;
         camp = c as u16;
     }
-    Some(ClRaw { id: Key::new(f[0], aid, arena), user: Key::new(f[1], aid, arena), ts, hash, camp, flags })
+    Some(ClRaw { id: Key::new(f[0], aid, arena), user: Key::new(f[1], aid, arena), ts, camp, flags })
 }
 
 /// Generic parallel parse over work units; each thread produces P partition vectors and one arena.
@@ -342,26 +332,28 @@ where
 // ---------- dedup ----------
 
 /// Per partition p: dedup event copies by event_id keeping min ingest, validate, scatter by user hash.
-fn dedup_events(files: &Arenas, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<EvValid>> {
+fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<EvValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     let cap = (total * 2).max(16).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: Vec<u32> = vec![u32::MAX; cap];
+    // slot -> (packed record index, hash) ; hash stored to avoid touching records on probe misses
+    let mut slots: Vec<(u32, u64)> = vec![(u32::MAX, 0); cap];
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     for (t, tv) in raws.iter().enumerate() {
         for (i, r) in tv[p].iter().enumerate() {
             let packed = ((t as u32) << 27) | (i as u32);
-            let mut s = (r.hash as usize) & mask;
+            let h = key_hash(&r.id, files);
+            let mut s = (h as usize) & mask;
             loop {
-                let cur = slots[s];
+                let (cur, ch) = slots[s];
                 if cur == u32::MAX {
-                    slots[s] = packed;
+                    slots[s] = (packed, h);
                     break;
                 }
-                let o = get(cur);
-                if o.hash == r.hash && o.id.same(&r.id, files) {
+                if ch == h && get(cur).id.same(&r.id, files) {
+                    let o = get(cur);
                     if r.ingest < o.ingest {
-                        slots[s] = packed;
+                        slots[s] = (packed, h);
                     }
                     break;
                 }
@@ -374,14 +366,14 @@ fn dedup_events(files: &Arenas, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<E
     for (t, tv) in raws.iter().enumerate() {
         for (i, r) in tv[p].iter().enumerate() {
             let packed = ((t as u32) << 27) | (i as u32);
-            let mut s = (r.hash as usize) & mask;
+            let h = key_hash(&r.id, files);
+            let mut s = (h as usize) & mask;
             let win = loop {
-                let cur = slots[s];
+                let (cur, ch) = slots[s];
                 if cur == packed {
                     break true;
                 }
-                let o = get(cur);
-                if o.hash == r.hash && o.id.same(&r.id, files) {
+                if ch == h && get(cur).id.same(&r.id, files) {
                     break false;
                 }
                 s = (s + 1) & mask;
@@ -390,43 +382,47 @@ fn dedup_events(files: &Arenas, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<E
                 continue;
             }
             let etype = r.flags >> 4;
-            let ok = (r.flags & 7) == 7 && etype < 3 && (etype != 2 || (r.flags & 8) != 0) && r.ingest - r.ts <= LATE;
+            let ok = (r.flags & 7) == 7
+                && etype < 3
+                && (etype != 2 || (r.flags & 8) != 0)
+                && (r.ingest as i64) * 1000 - (r.ts as i64) <= LATE;
             if !ok {
                 continue;
             }
-            let uhash = hash_bytes(r.user.bytes(files));
-            out[part(uhash)].push(EvValid { user: r.user, uhash, ts: r.ts, price: r.price, cat: r.cat, etype });
+            let uhash = key_hash(&r.user, files);
+            out[part(uhash)].push(EvValid { user: r.user, uhash, ts: ctx.ws + r.ts as i64, price: r.price, cat: r.cat, etype });
         }
     }
     out
 }
 
-fn dedup_clicks(files: &Arenas, raws: &[Vec<Vec<ClRaw>>], p: usize) -> Vec<Vec<ClValid>> {
+fn dedup_clicks(ctx: &Ctx, files: &Arenas, raws: &[Vec<Vec<ClRaw>>], p: usize) -> Vec<Vec<ClValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     let cap = (total * 2).max(16).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: Vec<u32> = vec![u32::MAX; cap];
+    let mut slots: Vec<(u32, u64)> = vec![(u32::MAX, 0); cap];
     let get = |packed: u32| -> &ClRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     let mut out: Vec<Vec<ClValid>> = (0..P).map(|_| Vec::with_capacity(total / P + 16)).collect();
+    let lo = ctx.ws - REACH;
     for (t, tv) in raws.iter().enumerate() {
         for (i, r) in tv[p].iter().enumerate() {
             let packed = ((t as u32) << 27) | (i as u32);
-            let mut s = (r.hash as usize) & mask;
+            let h = key_hash(&r.id, files);
+            let mut s = (h as usize) & mask;
             let fresh = loop {
-                let cur = slots[s];
+                let (cur, ch) = slots[s];
                 if cur == u32::MAX {
-                    slots[s] = packed;
+                    slots[s] = (packed, h);
                     break true;
                 }
-                let o = get(cur);
-                if o.hash == r.hash && o.id.same(&r.id, files) {
+                if ch == h && get(cur).id.same(&r.id, files) {
                     break false;
                 }
                 s = (s + 1) & mask;
             };
             if fresh && (r.flags & 7) == 7 {
-                let uhash = hash_bytes(r.user.bytes(files));
-                out[part(uhash)].push(ClValid { id: r.id, user: r.user, uhash, ts: r.ts, camp: r.camp });
+                let uhash = key_hash(&r.user, files);
+                out[part(uhash)].push(ClValid { id: r.id, user: r.user, uhash, ts: lo + r.ts as i64, camp: r.camp });
             }
         }
     }
@@ -733,7 +729,7 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
         for l in Lines::new(buf.data(), buf.lo, buf.hi) {
             if let Some(r) = parse_event_line(ctx, 0, &mut arena, l) {
-                acc = acc.wrapping_add(r.hash ^ r.ts as u64);
+                acc = acc.wrapping_add(r.ts as u64 ^ r.price as u64);
             }
         }
     }
@@ -744,7 +740,8 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
         for l in Lines::new(buf.data(), buf.lo, buf.hi) {
             if let Some(r) = parse_event_line(ctx, 0, &mut arena, l) {
-                out[part(r.hash)].push(r);
+                let h = key_hash(&r.id, std::slice::from_ref(&arena));
+                out[part(h)].push(r);
             }
         }
     }
@@ -827,20 +824,23 @@ fn main() {
 
     // Phase 1: parse
     let (ev_raw, ar_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, arena, line| {
-        parse_event_line(c, aid, arena, line).map(|r| (part(r.hash), r))
+        parse_event_line(c, aid, arena, line).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
     });
     log(&t0, "events parsed");
     let (cl_raw, ar_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, arena, line| {
-        parse_click_line(c, aid, arena, line).map(|r| (part(r.hash), r))
+        parse_click_line(c, aid, arena, line).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
     });
     let (links, ar_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, arena, line| {
         let mut f = [&b""[..]; 2];
         if !split_fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
             return None;
         }
-        let ha = hash_bytes(f[0]);
-        let hb = hash_bytes(f[1]);
-        Some((part(ha), LinkRaw { a: Key::new(f[0], aid, arena), b: Key::new(f[1], aid, arena), ha, hb }))
+        let a = Key::new(f[0], aid, arena);
+        let b = Key::new(f[1], aid, arena);
+        let ar = std::slice::from_ref(&*arena);
+        let ha = key_hash(&a, ar);
+        let hb = key_hash(&b, ar);
+        Some((part(ha), LinkRaw { a, b, ha, hb }))
     });
     log(&t0, "clicks+links parsed");
     let mut arenas: Vec<Vec<u8>> = Vec::with_capacity(3 * nthreads);
@@ -860,6 +860,7 @@ fn main() {
         std::thread::scope(|s| {
             for _ in 0..nthreads {
                 let next = &next;
+                let ctx = &ctx;
                 let ev_raw = &ev_raw;
                 let cl_raw = &cl_raw;
                 s.spawn(move || loop {
@@ -868,10 +869,10 @@ fn main() {
                         break;
                     }
                     if i < P {
-                        let r = dedup_events(files, ev_raw, i);
+                        let r = dedup_events(ctx, files, ev_raw, i);
                         unsafe { *evp.p().add(i) = Some(r) };
                     } else {
-                        let r = dedup_clicks(files, cl_raw, i - P);
+                        let r = dedup_clicks(ctx, files, cl_raw, i - P);
                         unsafe { *clp.p().add(i - P) = Some(r) };
                     }
                 });

@@ -47,3 +47,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-20 21:50: pread buffers + SIMD u128 splitter. Dev 1M: 0.13 s (was 0.35). 36/36, MATCH.
   Bench warm (10.8M lines, 782 MB, 1 thread): read+lines 0.21 | +split 0.57 | +parse 0.78 | +push 1.20 s.
   Next: 48-byte EvRaw (ts u32 offset, ingest i32 s, hash recomputed from Key), fuse newline search into SIMD pass.
+- 2026-11-20 22:15: 48-byte EvRaw / 40-byte ClRaw, key_hash from inline u128 (links MUST use the same hash: bug found+fixed).
+  10M on Mac, 8 threads: parse 0.57 | clicks+links 0.10 | dedup 0.50 | intern 0.14 | group 0.14 | walk 0.06 | out 0.09 => 1.68 s.
+  Dedup is latency-bound (random probes into 32 MB slot tables): add prefetch + winner bitmap. Parse: fuse newline into SIMD pass,
+  huge-page backed partition vectors (first-touch faults), SWAR F1.

@@ -72,6 +72,26 @@ impl SmallTable {
     }
 }
 
+/// Hash of a key: inline keys mix the u128 directly; arena keys hash their bytes.
+#[inline(always)]
+pub fn key_hash(k: &Key, arenas: &Arenas) -> u64 {
+    if k.is_inline() {
+        const K1: u64 = 0x9E37_79B9_7F4A_7C15;
+        const K2: u64 = 0xD6E8_FEB8_6659_FD93;
+        let lo = k.0 as u64;
+        let hi = (k.0 >> 64) as u64;
+        let mut h = (lo ^ K1).wrapping_mul(K2);
+        h ^= h >> 32;
+        h = (h ^ hi).wrapping_mul(K2);
+        h ^= h >> 29;
+        h = h.wrapping_mul(K1);
+        h ^= h >> 32;
+        h
+    } else {
+        hash_bytes(k.bytes(arenas))
+    }
+}
+
 /// Per-thread byte arenas hold the rare IDs longer than 15 bytes.
 pub type Arenas = [Vec<u8>];
 
