@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
-use util::{hash_bytes, Ref, SmallTable};
+use util::{hash_bytes, Key, SmallTable};
 
 const LOG_P: u32 = 4;
 const P: usize = 1 << LOG_P;
@@ -29,8 +29,8 @@ fn part(h: u64) -> usize {
 
 #[derive(Clone, Copy)]
 struct EvRaw {
-    id: Ref,
-    user: Ref,
+    id: Key,
+    user: Key,
     ts: i64,
     ingest: i64,
     hash: u64,
@@ -41,7 +41,7 @@ struct EvRaw {
 
 #[derive(Clone, Copy)]
 struct EvValid {
-    user: Ref,
+    user: Key,
     uhash: u64,
     ts: i64,
     price: u32,
@@ -68,8 +68,8 @@ struct EvFinal {
 
 #[derive(Clone, Copy)]
 struct ClRaw {
-    id: Ref,
-    user: Ref,
+    id: Key,
+    user: Key,
     ts: i64,
     hash: u64,
     camp: u16,
@@ -78,8 +78,8 @@ struct ClRaw {
 
 #[derive(Clone, Copy)]
 struct ClValid {
-    id: Ref,
-    user: Ref,
+    id: Key,
+    user: Key,
     uhash: u64,
     ts: i64,
     camp: u16,
@@ -87,7 +87,7 @@ struct ClValid {
 
 #[derive(Clone, Copy)]
 struct ClMid {
-    id: Ref,
+    id: Key,
     ts: i64,
     uid: u32,
     camp: u16,
@@ -95,15 +95,15 @@ struct ClMid {
 
 #[derive(Clone, Copy, Default)]
 struct ClFinal {
-    id: Ref,
+    id: Key,
     ts: i64,
     camp: u16,
 }
 
 #[derive(Clone, Copy)]
 struct LinkRaw {
-    a: Ref,
-    b: Ref,
+    a: Key,
+    b: Key,
     ha: u64,
     hb: u64,
 }
@@ -249,8 +249,8 @@ fn parse_event_line(ctx: &Ctx, fi: usize, base: *const u8, line: &[u8]) -> Optio
         }
     }
     Some(EvRaw {
-        id: Ref::new(fi, base, f[0]),
-        user: Ref::new(fi, base, f[1]),
+        id: Key::new(f[0], fi, base),
+        user: Key::new(f[1], fi, base),
         ts,
         ingest,
         hash,
@@ -284,7 +284,7 @@ fn parse_click_line(ctx: &Ctx, fi: usize, base: *const u8, line: &[u8]) -> Optio
         flags |= 4;
         camp = c as u16;
     }
-    Some(ClRaw { id: Ref::new(fi, base, f[0]), user: Ref::new(fi, base, f[1]), ts, hash, camp, flags })
+    Some(ClRaw { id: Key::new(f[0], fi, base), user: Key::new(f[1], fi, base), ts, hash, camp, flags })
 }
 
 /// Generic parallel parse over work units; each thread produces P partition vectors.
@@ -344,7 +344,7 @@ fn dedup_events(ctx: &Ctx, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<EvVali
                     break;
                 }
                 let o = get(cur);
-                if o.hash == r.hash && o.id.get(files) == r.id.get(files) {
+                if o.hash == r.hash && o.id.same(&r.id, files) {
                     if r.ingest < o.ingest {
                         slots[s] = packed;
                     }
@@ -355,19 +355,33 @@ fn dedup_events(ctx: &Ctx, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<EvVali
         }
     }
     let mut out: Vec<Vec<EvValid>> = (0..P).map(|_| Vec::with_capacity(total / P + 16)).collect();
-    for &cur in &slots {
-        if cur == u32::MAX {
-            continue;
+    // Second pass in record order (sequential memory): a record wins if its slot still holds it.
+    for (t, tv) in raws.iter().enumerate() {
+        for (i, r) in tv[p].iter().enumerate() {
+            let packed = ((t as u32) << 27) | (i as u32);
+            let mut s = (r.hash as usize) & mask;
+            let win = loop {
+                let cur = slots[s];
+                if cur == packed {
+                    break true;
+                }
+                let o = get(cur);
+                if o.hash == r.hash && o.id.same(&r.id, files) {
+                    break false;
+                }
+                s = (s + 1) & mask;
+            };
+            if !win {
+                continue;
+            }
+            let etype = r.flags >> 4;
+            let ok = (r.flags & 7) == 7 && etype < 3 && (etype != 2 || (r.flags & 8) != 0) && r.ingest - r.ts <= LATE;
+            if !ok {
+                continue;
+            }
+            let uhash = hash_bytes(r.user.bytes(files));
+            out[part(uhash)].push(EvValid { user: r.user, uhash, ts: r.ts, price: r.price, cat: r.cat, etype });
         }
-        let r = get(cur);
-        let etype = r.flags >> 4;
-        let ok = (r.flags & 7) == 7 && etype < 3 && (etype != 2 || (r.flags & 8) != 0) && r.ingest - r.ts <= LATE;
-        if !ok {
-            continue;
-        }
-        let ub = r.user.get(files);
-        let uhash = hash_bytes(ub);
-        out[part(uhash)].push(EvValid { user: r.user, uhash, ts: r.ts, price: r.price, cat: r.cat, etype });
     }
     out
 }
@@ -391,13 +405,13 @@ fn dedup_clicks(ctx: &Ctx, raws: &[Vec<Vec<ClRaw>>], p: usize) -> Vec<Vec<ClVali
                     break true;
                 }
                 let o = get(cur);
-                if o.hash == r.hash && o.id.get(files) == r.id.get(files) {
+                if o.hash == r.hash && o.id.same(&r.id, files) {
                     break false;
                 }
                 s = (s + 1) & mask;
             };
             if fresh && (r.flags & 7) == 7 {
-                let uhash = hash_bytes(r.user.get(files));
+                let uhash = hash_bytes(r.user.bytes(files));
                 out[part(uhash)].push(ClValid { id: r.id, user: r.user, uhash, ts: r.ts, camp: r.camp });
             }
         }
@@ -409,7 +423,7 @@ fn dedup_clicks(ctx: &Ctx, raws: &[Vec<Vec<ClRaw>>], p: usize) -> Vec<Vec<ClVali
 
 struct Intern {
     slots: Vec<u32>,
-    keys: Vec<(u64, Ref)>,
+    keys: Vec<(u64, Key)>,
     mask: usize,
 }
 
@@ -433,11 +447,11 @@ impl Intern {
         self.mask = mask;
     }
     #[inline]
-    fn insert(&mut self, h: u64, r: Ref, files: &[Mmap]) -> u32 {
+    fn insert(&mut self, h: u64, r: Key, files: &[Mmap]) -> u32 {
         if self.keys.len() * 4 >= self.slots.len() * 3 {
             self.grow();
         }
-        let b = r.get(files);
+        let b = r;
         let mut s = (h as usize) & self.mask;
         loop {
             let cur = self.slots[s];
@@ -447,14 +461,14 @@ impl Intern {
                 return (self.keys.len() - 1) as u32;
             }
             let k = &self.keys[cur as usize];
-            if k.0 == h && k.1.get(files) == b {
+            if k.0 == h && k.1.same(&b, files) {
                 return cur;
             }
             s = (s + 1) & self.mask;
         }
     }
     #[inline]
-    fn lookup(&self, h: u64, b: &[u8], files: &[Mmap]) -> Option<u32> {
+    fn lookup(&self, h: u64, b: &Key, files: &[Mmap]) -> Option<u32> {
         let mut s = (h as usize) & self.mask;
         loop {
             let cur = self.slots[s];
@@ -462,7 +476,7 @@ impl Intern {
                 return None;
             }
             let k = &self.keys[cur as usize];
-            if k.0 == h && k.1.get(files) == b {
+            if k.0 == h && k.1.same(&b, files) {
                 return Some(cur);
             }
             s = (s + 1) & self.mask;
@@ -758,7 +772,7 @@ fn main() {
         }
         let ha = hash_bytes(f[0]);
         let hb = hash_bytes(f[1]);
-        Some((part(ha), LinkRaw { a: Ref::new(fi, base, f[0]), b: Ref::new(fi, base, f[1]), ha, hb }))
+        Some((part(ha), LinkRaw { a: Key::new(f[0], fi, base), b: Key::new(f[1], fi, base), ha, hb }))
     });
     log(&t0, "clicks+links parsed");
 
@@ -835,8 +849,8 @@ fn main() {
             for l in lp {
                 let qa = part(l.ha);
                 let qb = part(l.hb);
-                let ua = base[qa] + parts[qa].table.lookup(l.ha, l.a.get(files), files).expect("link a");
-                let ub = base[qb] + parts[qb].table.lookup(l.hb, l.b.get(files), files).expect("link b");
+                let ua = base[qa] + parts[qa].table.lookup(l.ha, &l.a, files).expect("link a");
+                let ub = base[qb] + parts[qb].table.lookup(l.hb, &l.b, files).expect("link b");
                 let ra = find(&mut parent, ua);
                 let rb = find(&mut parent, ub);
                 if ra != rb {
@@ -851,7 +865,7 @@ fn main() {
     }
     drop(links);
     // id refs in global order
-    let mut id_ref: Vec<Ref> = Vec::with_capacity(n_ids);
+    let mut id_ref: Vec<Key> = Vec::with_capacity(n_ids);
     for q in 0..P {
         for k in &parts[q].table.keys {
             id_ref.push(k.1);
@@ -859,7 +873,7 @@ fn main() {
     }
     // roots, names, person indexes
     let mut person_of_uid = vec![u32::MAX; n_ids];
-    let mut person_name: Vec<Ref> = Vec::new();
+    let mut person_name: Vec<Key> = Vec::new();
     for u in 0..n_ids as u32 {
         let r = find(&mut parent, u);
         if person_of_uid[r as usize] == u32::MAX {
@@ -869,9 +883,7 @@ fn main() {
         let pi = person_of_uid[r as usize];
         if r != u {
             person_of_uid[u as usize] = pi;
-            let cur = person_name[pi as usize].get(files);
-            let mine = id_ref[u as usize].get(files);
-            if mine < cur {
+            if id_ref[u as usize].cmp_bytes(&person_name[pi as usize], files) == std::cmp::Ordering::Less {
                 person_name[pi as usize] = id_ref[u as usize];
             }
         }
@@ -936,7 +948,7 @@ fn main() {
                         let ev = unsafe { std::slice::from_raw_parts_mut(evp.p().add(es), ee - es) };
                         let cl = unsafe { std::slice::from_raw_parts_mut(clp.p().add(cs), ce - cs) };
                         ev.sort_unstable_by_key(|e| e.ts);
-                        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.get(files).cmp(b.id.get(files))));
+                        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, files)));
                         w.walk(p as u32, ev, cl);
                     }
                 }
@@ -952,7 +964,7 @@ fn main() {
     let mut uc = out::UserDailyCols::new(n_rows);
     for w in &walkers {
         for r in &w.rows {
-            let name = person_name[r.person as usize].get(files);
+            let name = person_name[r.person as usize].bytes(files);
             uc.user_id.append_value(unsafe { std::str::from_utf8_unchecked(name) });
             uc.day.push(r.day);
             uc.sessions.push(r.sessions as i64);

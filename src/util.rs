@@ -97,3 +97,75 @@ impl SmallTable {
         self.entries.len()
     }
 }
+
+/// An ID key: up to 15 bytes stored inline (top byte = length), longer ones as a Ref (top byte 0xFF).
+/// Inline keys compare with one u128 equality; nothing after parsing needs the input files again.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct Key(u128);
+
+impl Key {
+    #[inline(always)]
+    pub fn new(s: &[u8], file: usize, base: *const u8) -> Key {
+        let n = s.len();
+        if n <= 15 {
+            let mut buf = [0u8; 16];
+            buf[..n].copy_from_slice(s);
+            buf[15] = n as u8;
+            Key(u128::from_le_bytes(buf))
+        } else {
+            let r = Ref::new(file, base, s);
+            let packed = (r.off as u128) | ((r.file as u128) << 32) | ((r.len as u128) << 48);
+            Key(packed | (0xFFu128 << 120))
+        }
+    }
+    #[inline(always)]
+    pub fn is_inline(&self) -> bool {
+        (self.0 >> 120) as u8 != 0xFF
+    }
+    #[inline(always)]
+    pub fn bytes<'a>(&'a self, files: &'a [Mmap]) -> &'a [u8] {
+        let tag = (self.0 >> 120) as u8;
+        if tag != 0xFF {
+            // little-endian: byte 0 of the u128 is at the lowest address
+            unsafe { std::slice::from_raw_parts(self as *const Key as *const u8, tag as usize) }
+        } else {
+            let off = self.0 as u32 as usize;
+            let file = (self.0 >> 32) as u16 as usize;
+            let len = (self.0 >> 48) as u16 as usize;
+            &files[file][off..off + len]
+        }
+    }
+    #[inline(always)]
+    pub fn same(&self, other: &Key, files: &[Mmap]) -> bool {
+        if self.is_inline() && other.is_inline() {
+            self.0 == other.0
+        } else {
+            self.bytes(files) == other.bytes(files)
+        }
+    }
+    #[inline(always)]
+    pub fn cmp_bytes(&self, other: &Key, files: &[Mmap]) -> std::cmp::Ordering {
+        self.bytes(files).cmp(other.bytes(files))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn key_inline() {
+        let f: Vec<Mmap> = Vec::new();
+        let a = Key::new(b"u1", 0, std::ptr::null());
+        let b = Key::new(b"u1", 0, std::ptr::null());
+        let c = Key::new(b"U1", 0, std::ptr::null());
+        let d = Key::new(b"u1 ", 0, std::ptr::null());
+        assert!(a.same(&b, &f));
+        assert!(!a.same(&c, &f));
+        assert!(!a.same(&d, &f));
+        assert_eq!(a.bytes(&f), b"u1");
+        assert_eq!(Key::new(b"", 0, std::ptr::null()).bytes(&f), b"");
+        assert_eq!(Key::new(b"123456789012345", 0, std::ptr::null()).bytes(&f), b"123456789012345");
+        assert_eq!(c.cmp_bytes(&a, &f), std::cmp::Ordering::Less);
+    }
+}
