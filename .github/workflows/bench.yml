@@ -44,6 +44,11 @@ jobs:
           sudo rm -rf /tmp/out/*
           /usr/bin/time -f "wall %e s" docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
             -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NO_FORK=1 -e NCPU=4 shopsess:ci
+      - name: Run with USE_MMAP=1
+        run: |
+          sudo rm -rf /tmp/out/*
+          /usr/bin/time -f "wall %e s" docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \
+            -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 -e USE_MMAP=1 shopsess:ci
       - name: Single-thread parse stage breakdown (BENCH=1)
         run: |
           docker run --rm --network none --cpus 4 --memory 12g --user 1000:1000 \

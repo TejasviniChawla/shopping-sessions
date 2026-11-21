@@ -80,19 +80,115 @@ pub struct Buffer {
     pub lo: usize,
     /// Index in `buf` one past the last byte of the unit's data (end of last owned line, after its '\n').
     pub hi: usize,
+    /// Optional mmap of the unit (USE_MMAP=1): data() then points into the mapping.
+    map: *mut u8,
+    map_base: *mut u8,
+    map_len: usize,
+    use_mmap: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn populate_flag() -> libc::c_int {
+    libc::MAP_POPULATE
+}
+#[cfg(not(target_os = "linux"))]
+fn populate_flag() -> libc::c_int {
+    0
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        self.unmap();
+    }
 }
 
 impl Buffer {
     pub fn new() -> Self {
-        Buffer { buf: vec![0u8; UNIT + TAIL + PAD + 1], lo: 0, hi: 0 }
+        let use_mmap = std::env::var_os("USE_MMAP").is_some();
+        Buffer { buf: vec![0u8; UNIT + TAIL + PAD + 1], lo: 0, hi: 0, map: std::ptr::null_mut(), map_base: std::ptr::null_mut(), map_len: 0, use_mmap }
     }
 
     #[inline(always)]
     pub fn data(&self) -> &[u8] {
-        &self.buf[..self.hi]
+        if self.map.is_null() {
+            &self.buf[..self.hi]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.map, self.hi) }
+        }
+    }
+
+    fn unmap(&mut self) {
+        if !self.map.is_null() {
+            unsafe { libc::munmap(self.map_base as *mut libc::c_void, self.map_len) };
+            self.map = std::ptr::null_mut();
+            self.map_len = 0;
+        }
     }
 
     pub fn load(&mut self, file: &File, size: u64, u: Unit) {
+        self.unmap();
+        // mmap path: only for units whose tail (plus SIMD over-read) stays inside the file.
+        if self.use_mmap && u.end + (TAIL + PAD) as u64 <= size {
+            use std::os::unix::io::AsRawFd;
+            let page = 4096u64;
+            let rstart = u.start.saturating_sub(1);
+            let mstart = rstart / page * page;
+            let mend = u.end + TAIL as u64 + PAD as u64;
+            let len = (mend - mstart) as usize;
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | populate_flag(),
+                    file.as_raw_fd(),
+                    mstart as i64,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                let base = unsafe { (p as *mut u8).add((rstart - mstart) as usize) };
+                let data_len = (u.end + TAIL as u64 - rstart) as usize;
+                let d = unsafe { std::slice::from_raw_parts(base, data_len) };
+                let unit_off = (u.start - rstart) as usize;
+                let mut lo = if u.start == 0 {
+                    match memchr::memchr(b'\n', d) {
+                        Some(k) => k + 1,
+                        None => data_len,
+                    }
+                } else if d[0] == b'\n' {
+                    unit_off
+                } else {
+                    match memchr::memchr(b'\n', &d[unit_off..]) {
+                        Some(k) => unit_off + k + 1,
+                        None => data_len,
+                    }
+                };
+                let end_off = (u.end - rstart) as usize;
+                if lo > end_off {
+                    lo = end_off;
+                }
+                let hi = if end_off == 0 || end_off <= lo {
+                    lo
+                } else if d[end_off - 1] == b'\n' {
+                    end_off
+                } else {
+                    match memchr::memchr(b'\n', &d[end_off..]) {
+                        Some(k) => end_off + k + 1,
+                        None => usize::MAX, // line longer than TAIL: fall back to the copy path
+                    }
+                };
+                if hi != usize::MAX {
+                    self.map = base;
+                    self.map_len = len;
+                    // keep the mapping base for munmap: store the page-aligned pointer separately
+                    self.map_base = p as *mut u8;
+                    self.lo = lo;
+                    self.hi = hi;
+                    return;
+                }
+                unsafe { libc::munmap(p, len) };
+            }
+        }
         // Read from start-1 so the byte before the unit tells us whether `start` begins a line.
         let rstart = u.start.saturating_sub(1);
         let mut want = (u.end + TAIL as u64).min(size) - rstart;
