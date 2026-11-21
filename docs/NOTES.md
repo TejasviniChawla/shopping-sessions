@@ -189,3 +189,4 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   PIN=0 == pinned. Zen4 9V45: in-process 0.55-0.56 s, scan+parse 0.76-0.80 thread-s (76-80 ns/line); 9V74: 1.07 (slower
   clocks). Parse cost is instructions + mispredicts, not cache/TLB/scheduling. Events 65-96 B (99.8%), clicks <= 64 B
   -> mask builder exits at the chunk holding the newline (A/B vs two-round commit dispatched).
+- 2026-11-21 ~09:00 ET: two-round build ten seeds MATCH (frozen binary) -> main fast-forwarded to f616eb8 (recommended).
