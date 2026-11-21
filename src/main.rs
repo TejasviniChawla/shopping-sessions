@@ -373,6 +373,11 @@ fn event_ok(r: &EvRaw) -> bool {
     (r.flags & 7) == 7 && etype < 3 && (etype != 2 || (r.flags & 8) != 0) && (r.ingest as i64) * 1000 - (r.ts as i64) <= LATE
 }
 
+static WALK_NS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 static DEDUP_NS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -1361,6 +1366,8 @@ fn run() {
             let (person_name, user_dir) = (&person_name, &user_dir);
             let t0 = &t0;
             hs.push(s.spawn(move || {
+                pin_thread(t);
+                let (mut sort_ns, mut walk_ns) = (0u64, 0u64);
                 let mut w = Walker::new(ctx, sides, day0, ndays);
                 loop {
                     let b = next.fetch_add(1, Ordering::Relaxed) * BLOCK;
@@ -1375,11 +1382,18 @@ fn run() {
                         let (cs, ce) = (cl_start[p] as usize, cl_start[p + 1] as usize);
                         let ev = unsafe { std::slice::from_raw_parts_mut(evp.p().add(es), ee - es) };
                         let cl = unsafe { std::slice::from_raw_parts_mut(clp.p().add(cs), ce - cs) };
+                        let ts0 = Instant::now();
                         ev.sort_unstable();
                         cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, sides)));
+                        sort_ns += ts0.elapsed().as_nanos() as u64;
+                        let tw0 = Instant::now();
                         w.walk(p as u32, ev, cl);
+                        walk_ns += tw0.elapsed().as_nanos() as u64;
                     }
                 }
+                WALK_NS[0].fetch_add(sort_ns, Ordering::Relaxed);
+                WALK_NS[1].fetch_add(walk_ns, Ordering::Relaxed);
+                let tp0 = Instant::now();
                 if t == 0 {
                     eprintln!("[{:7.3}s] thread 0 walk done", t0.elapsed().as_secs_f64());
                 }
@@ -1398,12 +1412,21 @@ fn run() {
                     }
                     out::write_user_daily(&user_dir.join(format!("part-{}.parquet", t)), uc).expect("write user_daily");
                 }
+                WALK_NS[2].fetch_add(tp0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 (w.camp, n_rows)
             }));
         }
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    log(&t0, "sessions+attribution+user_daily done");
+    log(
+        &t0,
+        &format!(
+            "sessions+attribution+user_daily done (thread-seconds: sort {:.3}, walk {:.3}, parquet {:.3})",
+            WALK_NS[0].load(Ordering::Relaxed) as f64 / 1e9,
+            WALK_NS[1].load(Ordering::Relaxed) as f64 / 1e9,
+            WALK_NS[2].load(Ordering::Relaxed) as f64 / 1e9
+        ),
+    );
 
     // campaign_daily
     let n_rows: usize = results.iter().map(|r| r.1).sum();
