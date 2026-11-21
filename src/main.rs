@@ -415,10 +415,35 @@ struct ThreadOut {
     clicks: Vec<HugeVec<ClMid>>,
     ev_hist: Vec<u32>,
     cl_hist: Vec<u32>,
+    /// direct-mapped (key, person) cache: hot users hit here instead of the DRAM-resident global table
+    cache: Vec<(u64, u32)>,
 }
+const CACHE_BITS: u32 = 15;
 impl ThreadOut {
     fn new(hist_len: usize) -> Self {
-        ThreadOut { events: Vec::new(), clicks: Vec::new(), ev_hist: vec![0; hist_len], cl_hist: vec![0; hist_len] }
+        ThreadOut {
+            events: Vec::new(),
+            clicks: Vec::new(),
+            ev_hist: vec![0; hist_len],
+            cl_hist: vec![0; hist_len],
+            cache: vec![(0, 0); 1 << CACHE_BITS],
+        }
+    }
+    /// Person of a user key, via the cache (packed keys only) or the global table.
+    #[inline(always)]
+    fn person_of(&mut self, k: PKey, h: u64, table: &UTable, pm: PersonMap, sides: &Sides) -> u32 {
+        if k.is_packed() {
+            let ci = (h >> (64 - CACHE_BITS)) as usize;
+            let e = self.cache[ci];
+            if e.0 == k.0 {
+                return e.1;
+            }
+            let person = pm.person(table.get_or_insert(k, h, sides));
+            self.cache[ci] = (k.0, person);
+            person
+        } else {
+            pm.person(table.get_or_insert(k, h, sides))
+        }
     }
 }
 
@@ -505,7 +530,6 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, table: &U
     for t in 0..raws.len() {
         off[t + 1] = off[t] + raws[t][p].len();
     }
-    let hist = &mut to.ev_hist;
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
         let n = recs.len();
@@ -522,9 +546,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, table: &U
             let h = r.id.hash(sides);
             if sk.count(h) < 2 {
                 if event_ok(r) {
-                    let uid = table.get_or_insert(r.user, r.user.hash(sides), sides);
-                    let person = pm.person(uid);
-                    bump(hist, person);
+                    let person = to.person_of(r.user, r.user.hash(sides), table, pm, sides);
+                    bump(&mut to.ev_hist, person);
                     out.push(EvMid { ts: r.ts, person, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
                 }
             } else {
@@ -537,7 +560,7 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, table: &U
     let tp = Instant::now();
     let cap = (cands.len() * 2).max(64).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: Vec<(u32, PKey)> = vec![(u32::MAX, PKey(0)); cap];
+    let mut slots: Vec<(u32, i32, PKey)> = vec![(u32::MAX, 0, PKey(0)); cap];
     let mut win = vec![0u64; (total + 63) / 64 + 1];
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     let nc = cands.len();
@@ -554,16 +577,15 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, table: &U
         let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
         let mut s = (h as usize) & mask;
         loop {
-            let (cur, ck) = slots[s];
+            let (cur, cing, ck) = slots[s];
             if cur == u32::MAX {
-                slots[s] = (packed, r.id);
+                slots[s] = (packed, r.ingest, r.id);
                 win[dense >> 6] |= 1 << (dense & 63);
                 break;
             }
             if ck.same(&r.id, sides) {
-                let o = get(cur);
-                if r.ingest < o.ingest {
-                    slots[s] = (packed, r.id);
+                if r.ingest < cing {
+                    slots[s] = (packed, r.ingest, r.id);
                     let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
                     win[od >> 6] &= !(1 << (od & 63));
                     win[dense >> 6] |= 1 << (dense & 63);
@@ -580,9 +602,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, table: &U
         }
         let r = get(packed);
         if event_ok(r) {
-            let uid = table.get_or_insert(r.user, r.user.hash(sides), sides);
-            let person = pm.person(uid);
-            bump(hist, person);
+            let person = to.person_of(r.user, r.user.hash(sides), table, pm, sides);
+            bump(&mut to.ev_hist, person);
             out.push(EvMid { ts: r.ts, person, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
         }
     }
@@ -612,7 +633,6 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize, table: &U
     let mut slots: Vec<PKey> = vec![PKey(0); cap];
     let mut used: Vec<bool> = vec![false; cap];
     let mut out: HugeVec<ClMid> = HugeVec::with_capacity(total + 16);
-    let hist = &mut to.cl_hist;
     for tv in raws.iter() {
         let recs = &tv[p][..];
         let n = recs.len();
@@ -644,9 +664,8 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize, table: &U
                 }
             };
             if fresh && (r.flags & 7) == 7 {
-                let uid = table.get_or_insert(r.user, r.user.hash(sides), sides);
-                let person = pm.person(uid);
-                bump(hist, person);
+                let person = to.person_of(r.user, r.user.hash(sides), table, pm, sides);
+                bump(&mut to.cl_hist, person);
                 out.push(ClMid { id: r.id, ts: r.ts, person, camp: r.camp });
             }
         }
