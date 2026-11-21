@@ -27,11 +27,10 @@ fn part(h: u64, log_p: u32) -> usize {
     (h >> (64 - log_p)) as usize
 }
 
-/// Partition count: about 16k records per partition, at most 256 partitions (write streams per thread; CI sweep pending);
-/// dedup sub-buckets each partition further so its table stays inside L2.
+/// Partition count: about 20k records per partition (a 2x table of 16-byte slots is 1 MB), at most 1024.
 fn choose_log_p(n_est: usize) -> u32 {
     let mut lp = 6;
-    while lp < 8 && (n_est >> lp) > 16000 {
+    while lp < 10 && (n_est >> lp) > 20000 {
         lp += 1;
     }
     lp
@@ -466,15 +465,10 @@ fn event_ok(r: &EvRaw) -> bool {
 /// Per-thread scratch reused across partition tasks.
 #[derive(Default)]
 struct Scratch {
-    slots: Vec<(u64, i32, u32)>,
+    slots: Vec<(u64, u32)>,
     win: Vec<u64>,
     ckeys: Vec<u64>,
-    recs: Vec<EvRaw>,
-    starts: Vec<u32>,
 }
-
-/// Records per dedup sub-bucket: a 2x table of 16-byte slots for this many records is 256 KB.
-const SUB_TARGET: usize = 8000;
 
 #[inline(always)]
 fn person_key(user: PKey, lm: &LinkMap) -> u64 {
@@ -483,79 +477,75 @@ fn person_key(user: PKey, lm: &LinkMap) -> u64 {
 
 const PF: usize = 24;
 
-/// Partition p: records are copied into the thread's scratch grouped by sub-bucket (a few hash bits below
-/// the partition bits), each sub-bucket is deduped in an L2-resident table keyed by event id keeping the
-/// copy with the smallest ingest, then survivors are walked in order, validated, resolved to a person and
-/// pushed to the thread's scatter.
-fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch, out: &mut Scatter<PRec>, log_p: u32) {
+/// Timing accumulators (thread-nanoseconds) for the dedup and person stages, printed when TIMING is set.
+static T_DEDUP: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static T_PERSON: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+#[inline(always)]
+fn tick(timing: bool, acc: &std::sync::atomic::AtomicU64, t: &mut Instant) {
+    if timing {
+        let now = Instant::now();
+        acc.fetch_add((now - *t).as_nanos() as u64, Ordering::Relaxed);
+        *t = now;
+    }
+}
+
+/// Partition p, two passes over the raw records (no copy): pass 1 probes an L2-resident table keyed by
+/// event id and keeps the copy with the smallest ingest (the loser's "win" bit is cleared); pass 2 walks
+/// the records in memory order, validates winners, resolves the person and pushes to the thread's scatter.
+fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch, out: &mut Scatter<PRec>, log_p: u32, timing: bool) {
+    let mut t = Instant::now();
     let total: usize = raws.iter().map(|r| r.len(p)).sum();
     if total == 0 {
         return;
     }
-    let mut log_sb = 0u32;
-    while (total >> log_sb) > SUB_TARGET && log_sb < 8 {
-        log_sb += 1;
-    }
-    let nsb = 1usize << log_sb;
-    let shift = 64 - log_p - log_sb;
-    // counting sort of the partition's records by sub-bucket into the scratch copy
-    let starts = &mut sc.starts;
-    starts.clear();
-    starts.resize(nsb + 1, 0);
+    // slices of this partition: index = (slice id << 26) | position, dense = base[slice] + position
+    let mut slices: Vec<&[EvRaw]> = Vec::with_capacity(raws.len() * 2);
+    let mut base: Vec<u32> = Vec::with_capacity(raws.len() * 2 + 1);
+    let mut acc = 0u32;
     for r in raws {
         for sl in r.get(p) {
-            for rec in sl {
-                starts[((rec.id.hash() >> shift) as usize & (nsb - 1)) + 1] += 1;
+            if !sl.is_empty() {
+                slices.push(sl);
+                base.push(acc);
+                acc += sl.len() as u32;
             }
         }
     }
-    for i in 0..nsb {
-        starts[i + 1] += starts[i];
-    }
-    let recs = &mut sc.recs;
-    recs.clear();
-    recs.resize(total, EvRaw::default());
-    {
-        let mut pos: Vec<u32> = starts[..nsb].to_vec();
-        for r in raws {
-            for sl in r.get(p) {
-                for rec in sl {
-                    let b = (rec.id.hash() >> shift) as usize & (nsb - 1);
-                    recs[pos[b] as usize] = *rec;
-                    pos[b] += 1;
-                }
-            }
-        }
-    }
+    assert!(slices.len() < 64 && total < (1 << 26), "partition too large: raise LOG_P");
+    let cap = (total * 2).max(64).next_power_of_two();
+    let mask = cap - 1;
+    let slots = &mut sc.slots; // (key, idx)
+    slots.clear();
+    slots.resize(cap, (0, 0));
     let win = &mut sc.win;
     win.clear();
     win.resize(total / 64 + 1, 0);
-    let slots = &mut sc.slots;
-    for b in 0..nsb {
-        let (lo, hi) = (starts[b] as usize, starts[b + 1] as usize);
-        if lo == hi {
-            continue;
-        }
-        let cap = ((hi - lo) * 2).max(64).next_power_of_two();
-        let mask = cap - 1;
-        slots.clear();
-        slots.resize(cap, (0, 0, 0));
-        for dense in lo..hi {
-            let rec = &recs[dense];
+    for (si, sl) in slices.iter().enumerate() {
+        let b = base[si];
+        for (i, rec) in sl.iter().enumerate() {
             let key = rec.id.0;
+            let idx = ((si as u32) << 26) | i as u32;
+            let dense = b + i as u32;
             let mut s = (rec.id.hash() as usize) & mask;
             loop {
-                let (k, ing, d) = slots[s];
+                let (k, oidx) = slots[s];
                 if k == 0 {
-                    slots[s] = (key, rec.ingest, dense as u32);
-                    win[dense >> 6] |= 1 << (dense & 63);
+                    slots[s] = (key, idx);
+                    win[(dense >> 6) as usize] |= 1 << (dense & 63);
                     break;
                 }
                 if k == key {
-                    if rec.ingest < ing {
-                        slots[s] = (key, rec.ingest, dense as u32);
-                        win[(d >> 6) as usize] &= !(1 << (d & 63));
-                        win[dense >> 6] |= 1 << (dense & 63);
+                    let other = &slices[(oidx >> 26) as usize][(oidx & 0x3FF_FFFF) as usize];
+                    if rec.ingest < other.ingest {
+                        slots[s] = (key, idx);
+                        let od = base[(oidx >> 26) as usize] + (oidx & 0x3FF_FFFF);
+                        win[(od >> 6) as usize] &= !(1 << (od & 63));
+                        win[(dense >> 6) as usize] |= 1 << (dense & 63);
                     }
                     break;
                 }
@@ -563,22 +553,25 @@ fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
             }
         }
     }
-    let n = total;
-    for i in 0..n.min(PF) {
-        lm.prefetch(recs[i].user.hash());
-    }
-    for dense in 0..n {
-        if dense + PF < n {
-            lm.prefetch(recs[dense + PF].user.hash());
+    tick(timing, &T_DEDUP[0], &mut t);
+    let mut dense = 0usize;
+    for sl in &slices {
+        let n = sl.len();
+        for i in 0..n.min(PF) {
+            lm.prefetch(sl[i].user.hash());
         }
-        if (win[dense >> 6] >> (dense & 63)) & 1 != 0 {
-            let rec = &recs[dense];
-            if event_ok(rec) {
+        for (i, rec) in sl.iter().enumerate() {
+            if i + PF < n {
+                lm.prefetch(sl[i + PF].user.hash());
+            }
+            if (win[dense >> 6] >> (dense & 63)) & 1 != 0 && event_ok(rec) {
                 let pk = person_key(rec.user, lm);
                 out.push(part(PKey(pk).hash(), log_p), PRec { pkey: pk, ts: rec.ts, packed: pack_ev(rec.price, rec.cat, (rec.flags >> 4) == 2) });
             }
+            dense += 1;
         }
     }
+    tick(timing, &T_DEDUP[1], &mut t);
 }
 
 /// Partition p of clicks: the first copy of each click id is kept (copies are identical).
@@ -870,7 +863,9 @@ fn person_partition(
     cls: &[Parts<CRec>],
     w: &mut Walker,
     radix_tmp: &mut Vec<u64>,
+    timing: bool,
 ) {
+    let mut tm = Instant::now();
     let nev: usize = evs.iter().map(|t| t.len(q)).sum();
     let ncl: usize = cls.iter().map(|t| t.len(q)).sum();
     let mut ids = LocalIds::new(nev / 12 + ncl / 12 + 64);
@@ -918,6 +913,7 @@ fn person_partition(
             }
         }
     }
+    tick(timing, &T_PERSON[0], &mut tm);
     let np = ids.keys.len();
     cnt.resize(np, 0);
     ccnt.resize(np, 0);
@@ -959,6 +955,7 @@ fn person_partition(
     }
     drop(ev_lid);
     drop(cl_lid);
+    tick(timing, &T_PERSON[1], &mut tm);
     // per person: sort + walk
     for l in 0..np {
         let (es, ee) = (estart[l] as usize, estart[l + 1] as usize);
@@ -974,7 +971,13 @@ fn person_partition(
         }
         let cl = &mut cl_sorted[cs..ce];
         cl.sort_unstable_by(click_order);
+        if timing {
+            tick(true, &T_PERSON[2], &mut tm);
+        }
         w.walk(ids.keys[l], ev, cl);
+        if timing {
+            tick(true, &T_PERSON[3], &mut tm);
+        }
     }
 }
 
@@ -1067,6 +1070,7 @@ fn run() {
     let n_est = (ev_bytes / 75) as usize + 1024;
     let log_p = std::env::var("LOG_P").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| choose_log_p(n_est));
     let np = 1usize << log_p;
+    let timing = std::env::var_os("TIMING").is_some();
     let ctx = Ctx { ws, we, products, campaigns, ncat, cat_names, cat_rank, ncamp, camp_names, channels, nthreads, log_p };
     log(&t0, &format!("setup: {} files, {} threads, {} event units, {} partitions", inputs.files.len(), nthreads, inputs.events.len(), np));
 
@@ -1153,7 +1157,7 @@ fn run() {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i < np {
-                        dedup_events(ev_raw, i, lm, &mut sc, &mut pout, log_p);
+                        dedup_events(ev_raw, i, lm, &mut sc, &mut pout, log_p, timing);
                     } else if i < np + n_cu {
                         let u = inputs.clicks[i - np];
                         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
@@ -1230,7 +1234,7 @@ fn run() {
                     if i >= np {
                         break;
                     }
-                    person_partition(order[i], evs, cls, &mut w, &mut radix_tmp);
+                    person_partition(order[i], evs, cls, &mut w, &mut radix_tmp, timing);
                 }
                 let n_rows = w.rows.len();
                 if n_rows > 0 || t == 0 {
@@ -1252,6 +1256,13 @@ fn run() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     log(&t0, "sessions+attribution+user_daily done");
+    if timing {
+        let g = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+        eprintln!(
+            "    thread-seconds: dedup probe {:.3}, dedup emit {:.3}; person ids {:.3}, counting sort {:.3}, sorts {:.3}, walk {:.3}",
+            g(&T_DEDUP[0]), g(&T_DEDUP[1]), g(&T_PERSON[0]), g(&T_PERSON[1]), g(&T_PERSON[2]), g(&T_PERSON[3])
+        );
+    }
 
     let n_rows: usize = results.iter().map(|r| r.1).sum();
     let ncells = (ctx.ncamp as usize + 1) * ndays;
