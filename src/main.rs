@@ -735,6 +735,37 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
         }
     }
     eprintln!("bench +split_fields: {} {:.3}s", ok, t.elapsed().as_secs_f64());
+    // split + timestamps only
+    let t = Instant::now();
+    let mut acc = 0i64;
+    for &u in units {
+        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+        while let Some((l, m)) = sc.next() {
+            let mut f = [&b""[..]; 7];
+            if split_scanned(l, m, &mut f) {
+                acc = acc.wrapping_add(parse_ts(f[2]).unwrap_or(0)).wrapping_add(parse_f1(f[3]).unwrap_or(0));
+            }
+        }
+    }
+    eprintln!("bench +split+timestamps: {} {:.3}s", acc, t.elapsed().as_secs_f64());
+    // split + keys only
+    let t = Instant::now();
+    let mut acc = 0u64;
+    let mut side = Side::new();
+    for &u in units {
+        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+        while let Some((l, m)) = sc.next() {
+            let mut f = [&b""[..]; 7];
+            if split_scanned(l, m, &mut f) {
+                let a = PKey::new(f[0], 0, &mut side);
+                let b = PKey::new(f[1], 0, &mut side);
+                acc = acc.wrapping_add(a.0 ^ b.0);
+            }
+        }
+    }
+    eprintln!("bench +split+keys: {} {:.3}s", acc, t.elapsed().as_secs_f64());
     let t = Instant::now();
     let mut acc = 0u64;
     let mut side = Side::new();
