@@ -73,3 +73,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 03:50: first x86 CI (Ice Lake 8370C, 4 vCPU, 10M): 1.58 s in-container: parse 0.64 | clicks+links 0.13 | dedup 0.24 |
   intern 0.15 | persons 0.09 | group 0.12 | walk+out 0.19. Then: branchless quote handling, lex_key (no base-37 decode in naming),
   parallel link resolution, P=64 partitions, per-thread grouping histograms. Mac 10M best 0.89 s.
+- 2026-11-21 04:30: CI (EPYC 7763, 4 vCPU, P=16 branchless): 1.34 s in-container (parse 0.60, dedup 0.18, intern 0.11, group 0.11,
+  walk+out 0.18); docker overhead there ~0.17 s. P=64 run OOM-killed in dedup: P*P=4096 tiny HugeVecs each rounded to a 2 MB
+  THP page = 8 GB+. Fix: huge pages only for >= 8 MB allocations; P=32.

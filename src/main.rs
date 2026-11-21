@@ -14,7 +14,7 @@ use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
 use util::{prefetch, HugeVec, PKey, Side, Sides, SmallTable};
 
-const LOG_P: u32 = 6;
+const LOG_P: u32 = 5;
 const P: usize = 1 << LOG_P;
 const SESSION_GAP: i64 = 30 * ts::MINUTE;
 const LATE: i64 = DAY;

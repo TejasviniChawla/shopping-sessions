@@ -189,6 +189,8 @@ unsafe impl<T: Send> Send for HugeVec<T> {}
 unsafe impl<T: Sync> Sync for HugeVec<T> {}
 
 const HUGE: usize = 2 << 20;
+/// Below this size an allocation uses normal pages and page-size rounding (P*P small vectors must not each take 2 MB).
+const HUGE_MIN: usize = 8 << 20;
 
 fn map_bytes(bytes: usize) -> *mut u8 {
     unsafe {
@@ -202,7 +204,7 @@ fn map_bytes(bytes: usize) -> *mut u8 {
         );
         assert!(p != libc::MAP_FAILED, "mmap failed for {} bytes", bytes);
         #[cfg(target_os = "linux")]
-        {
+        if bytes >= HUGE_MIN {
             libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
         }
         p as *mut u8
@@ -212,7 +214,9 @@ fn map_bytes(bytes: usize) -> *mut u8 {
 impl<T: Copy> HugeVec<T> {
     pub fn with_capacity(cap: usize) -> Self {
         let size = std::mem::size_of::<T>().max(1);
-        let bytes = (cap.max(64) * size + HUGE - 1) / HUGE * HUGE;
+        let raw = cap.max(64) * size;
+        let unit = if raw >= HUGE_MIN { HUGE } else { 4096 };
+        let bytes = (raw + unit - 1) / unit * unit;
         let ptr = map_bytes(bytes) as *mut T;
         HugeVec { ptr, len: 0, cap: bytes / size }
     }
@@ -233,7 +237,9 @@ impl<T: Copy> HugeVec<T> {
     #[cold]
     fn grow(&mut self) {
         let size = std::mem::size_of::<T>().max(1);
-        let new_bytes = (self.cap * 2 * size + HUGE - 1) / HUGE * HUGE;
+        let raw = self.cap * 2 * size;
+        let unit = if raw >= HUGE_MIN { HUGE } else { 4096 };
+        let new_bytes = (raw + unit - 1) / unit * unit;
         let np = map_bytes(new_bytes) as *mut T;
         unsafe {
             std::ptr::copy_nonoverlapping(self.ptr, np, self.len);
