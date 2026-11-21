@@ -230,7 +230,8 @@ fn pool_put(p: *mut u8, bytes: usize) {
 /// Unmap everything in the pool using `nthreads` threads. Called right before exit, when most threads are
 /// idle, so the page-table teardown is parallel instead of serialized in the kernel's exit path.
 pub fn pool_drain_parallel(nthreads: usize) {
-    if std::env::var_os("NO_DRAIN").is_some() {
+    // measured: the parallel unmap costs 0.03-0.05 s and exit teardown was not on the critical path; opt-in only
+    if std::env::var_os("DRAIN").is_none() {
         return;
     }
     let items: Vec<(usize, usize)> = std::mem::take(&mut *POOL.lock().unwrap());

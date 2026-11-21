@@ -96,6 +96,17 @@ jobs:
           rm -rf /tmp/out2; mkdir -p /tmp/out2
           DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf record -q -F 2000 -g -o /tmp/perf.data /tmp/shopsess 2>/dev/null || true
           perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -vE "^#|^$" | head -40 || true
+      - name: Native timing of main vs comparison binary (process exit included, docker excluded)
+        if: ${{ github.event.inputs.compare != '' }}
+        run: |
+          docker create --name tmpc2 shopsess:cmp && docker cp tmpc2:/shopsess /tmp/shopsess_cmp && docker rm tmpc2 >/dev/null
+          docker create --name tmpc3 shopsess:ci && docker cp tmpc3:/shopsess /tmp/shopsess_main && docker rm tmpc3 >/dev/null
+          for b in main cmp main cmp; do
+            sudo rm -rf /tmp/out3; mkdir -p /tmp/out3
+            echo "=== native $b ==="
+            DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out3 NCPU=4 NO_FORK=1 /usr/bin/time -f "elapsed %e s, sys %S s" /tmp/shopsess_$b 2>&1 | grep -E "wrote|elapsed"
+            du -sh /tmp/out3 | cut -f1
+          done
       - name: Env experiments (native, perf stat)
         if: ${{ github.event.inputs.envs != '' }}
         run: |
