@@ -54,3 +54,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-20 22:45: fused newline SIMD scanner, HugeVec (mmap+MADV_HUGEPAGE) buffers, dedup prefetch + winner bitmap.
   10M Mac: parse 0.38-0.6 | dedup 0.35 | intern 0.13 | group 0.12 | walk 0.05 | out 0.11 => 1.3-1.5 s. RSS 1.05 GB.
   Parse scales only ~2.4x on 8 Mac threads (page-fault serialization suspected). Need Linux measurements (Docker VM arm64).
+- 2026-11-20 23:20: Python reference (../tools/reference.py) passes 36/36 fixtures; used as an independent oracle on other seeds.
+  Added fork-and-exit wrapper (Linux only; NO_FORK=1 disables). Parallel user_daily parts: output phase now ~0.07 s on 10M.
