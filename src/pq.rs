@@ -210,28 +210,24 @@ pub fn write_opts(path: &std::path::Path, cols: &[Col], nrows: usize, snappy: bo
         let mut first_data_page: Option<u64> = None;
         if let Col::DictStr(_, offs, bytes) = c {
             // build the dictionary over the whole chunk (consecutive duplicates are the common case)
+            // Run-based dictionary: a new entry whenever the value changes. Rows arrive grouped by value, so this
+            // is as compact as a hashed dictionary here, and a repeated entry is still a valid Parquet dictionary.
             let mut dict_bytes: Vec<u8> = Vec::with_capacity(bytes.len() / 2 + 16);
             let mut ids: Vec<u32> = Vec::with_capacity(nrows);
-            let mut map: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::with_capacity(nrows / 2 + 16);
-            let mut last: Option<(&[u8], u32)> = None;
+            let mut ndict = 0usize;
+            let mut last: &[u8] = &[];
+            let mut have_last = false;
             for i in 0..nrows {
                 let sl = &bytes[offs[i] as usize..offs[i + 1] as usize];
-                let id = match last {
-                    Some((p, id)) if p == sl => id,
-                    _ => {
-                        let next = map.len() as u32;
-                        let id = *map.entry(sl).or_insert_with(|| {
-                            dict_bytes.extend_from_slice(&(sl.len() as u32).to_le_bytes());
-                            dict_bytes.extend_from_slice(sl);
-                            next
-                        });
-                        last = Some((sl, id));
-                        id
-                    }
-                };
-                ids.push(id);
+                if !(have_last && sl == last) {
+                    dict_bytes.extend_from_slice(&(sl.len() as u32).to_le_bytes());
+                    dict_bytes.extend_from_slice(sl);
+                    ndict += 1;
+                    last = sl;
+                    have_last = true;
+                }
+                ids.push((ndict - 1) as u32);
             }
-            let ndict = map.len();
             let width = if ndict <= 1 { 1 } else { 32 - (ndict as u32 - 1).leading_zeros() };
             // dictionary page
             let (hdr, body) = if snappy {

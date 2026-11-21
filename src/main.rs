@@ -731,6 +731,52 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
+/// LSD radix sort of u64 keys on the top 32 bits only (the timestamp); the low 32 bits need no order.
+/// Four 8-bit passes between `v` and `tmp`.
+fn radix_sort_u64(v: &mut [u64], tmp: &mut Vec<u64>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.resize(n, 0);
+    let mut src_is_v = true;
+    for pass in 0..4 {
+        let shift = 32 + pass * 8;
+        let mut counts = [0u32; 256];
+        {
+            let src: &[u64] = if src_is_v { v } else { tmp };
+            for &x in src {
+                counts[((x >> shift) & 0xFF) as usize] += 1;
+            }
+        }
+        // skip a pass where every key shares the byte
+        if counts.iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let mut sum = 0u32;
+        for c in counts.iter_mut() {
+            let x = *c;
+            *c = sum;
+            sum += x;
+        }
+        if src_is_v {
+            for &x in v.iter() {
+                let b = ((x >> shift) & 0xFF) as usize;
+                tmp[counts[b] as usize] = x;
+                counts[b] += 1;
+            }
+        } else {
+            for &x in tmp.iter() {
+                let b = ((x >> shift) & 0xFF) as usize;
+                v[counts[b] as usize] = x;
+                counts[b] += 1;
+            }
+        }
+        src_is_v = !src_is_v;
+    }
+    if !src_is_v {
+        v.copy_from_slice(tmp);
+    }
+}
+
 // ---------- per-person walk ----------
 
 #[derive(Clone, Copy)]
@@ -1368,6 +1414,7 @@ fn run() {
             hs.push(s.spawn(move || {
                 pin_thread(t);
                 let (mut sort_ns, mut walk_ns) = (0u64, 0u64);
+                let mut radix_tmp: Vec<u64> = Vec::new();
                 let mut w = Walker::new(ctx, sides, day0, ndays);
                 loop {
                     let b = next.fetch_add(1, Ordering::Relaxed) * BLOCK;
@@ -1383,7 +1430,11 @@ fn run() {
                         let ev = unsafe { std::slice::from_raw_parts_mut(evp.p().add(es), ee - es) };
                         let cl = unsafe { std::slice::from_raw_parts_mut(clp.p().add(cs), ce - cs) };
                         let ts0 = Instant::now();
-                        ev.sort_unstable();
+                        if ev.len() >= 4096 {
+                            radix_sort_u64(ev, &mut radix_tmp);
+                        } else {
+                            ev.sort_unstable();
+                        }
                         cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, sides)));
                         sort_ns += ts0.elapsed().as_nanos() as u64;
                         let tw0 = Instant::now();
