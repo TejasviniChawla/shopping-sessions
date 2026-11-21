@@ -141,3 +141,12 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   PKey compares by u64 only (no Side tables). 36/36 fixtures, dev MATCH. Mac stage log 10M: parse 0.46, dedup 0.17, click
   dedup 0.02, persons 0.10, total 0.76 s (v2 1.10 s same run). CI A/B vs 2bf102e: run 44877150577. Ten-seed check running.
   Old main.rs saved as docs/main_v2_final_backup.rs.txt.
+- 2026-11-22 ~13:30 ET: CI A/B of first v3 (047e9a1) vs 2bf102e: LOSS 1.23-1.26 vs 1.18-1.21 wall (Zen3 4 vCPU 10M). Stage
+  compare: v3 saved intern+persons (-0.10) but parse +0.06 (link-map thread oversubscribed) and dedup +0.05. v3 ten seeds MATCH.
+  Second survey (top repos: hansliu-dev/676767 = team 67 0.59 s; Dremix10 C++ 0.66 s; zlyuan9 0.37-0.44 s native 20M with
+  dedup 50 ms / persons 75 ms): the fast entries use 1024-2048 partitions so dedup tables sit in L2, 64 B write-combining
+  lines with NT stores (Vibhor: -12-15% on board), huge-page arenas, 30-min bins instead of sort.
+  4145b80: runtime partition count (LOG_P env override), Scatter = one arena per producer + 64 B staging lines + NT stores
+  (Parts<T> readers), dedup = per-partition sub-buckets (~8k recs) with one L2 table, no sketch; link map built as task 0 of
+  the event-parse queue. Mac 10M: LOG_P=6 0.49 s total (parse 0.255!), 8: 0.67, 10: 1.08 -> fewer write streams win on the
+  Mac; CI sweep LOG_P 6/7/8(default)/9/10 + A/B vs 2bf102e: run 44878125122. Fixtures 36/36, dev MATCH at 6 and 10.
