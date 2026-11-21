@@ -267,6 +267,7 @@ impl PKey {
         v * POW37[(12 - n) as usize]
     }
     /// Inverse of `lex_key`.
+    #[allow(dead_code)]
     pub fn from_lex_key(mut l: u64) -> PKey {
         while l != 0 && l % 37 == 0 {
             l /= 37;
@@ -358,292 +359,12 @@ mod pkey_tests {
     }
 }
 
-/// A growable array backed by anonymous mmap with transparent huge pages requested (Linux).
-/// Fewer first-touch page faults than malloc for multi-hundred-MB vectors, and cheap teardown.
-pub struct HugeVec<T> {
-    ptr: *mut T,
-    len: usize,
-    cap: usize,
-    bytes: usize,
-}
-unsafe impl<T: Send> Send for HugeVec<T> {}
-unsafe impl<T: Sync> Sync for HugeVec<T> {}
-
 const HUGE: usize = 2 << 20;
-/// Below this size an allocation uses normal pages and page-size rounding (P*P small vectors must not each take 2 MB).
-const HUGE_MIN: usize = 2 << 20;
-
-#[cfg(target_os = "linux")]
-fn populate() -> libc::c_int {
-    if std::env::var_os("POPULATE").is_some() { libc::MAP_POPULATE } else { 0 }
-}
-#[cfg(not(target_os = "linux"))]
-fn populate() -> libc::c_int {
-    0
-}
-
-/// Pool of released mappings: later phases reuse already-faulted memory instead of unmapping and re-faulting.
-static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-
-fn pool_take(bytes: usize) -> Option<*mut u8> {
-    if std::env::var_os("NO_POOL").is_some() {
-        return None;
-    }
-    let mut pool = POOL.lock().unwrap();
-    // best fit: smallest mapping that is large enough
-    let mut best: Option<usize> = None;
-    for (i, &(_, b)) in pool.iter().enumerate() {
-        if b >= bytes && best.map_or(true, |j| pool[j].1 > b) {
-            best = Some(i);
-        }
-    }
-    best.map(|i| {
-        let (p, _) = pool.swap_remove(i);
-        p as *mut u8
-    })
-}
-
-fn pool_put(p: *mut u8, bytes: usize) {
-    POOL.lock().unwrap().push((p as usize, bytes));
-}
-
-/// Unmap everything in the pool using `nthreads` threads. Called right before exit, when most threads are
-/// idle, so the page-table teardown is parallel instead of serialized in the kernel's exit path.
-pub fn pool_drain_parallel(nthreads: usize) {
-    // measured: the parallel unmap costs 0.03-0.05 s and exit teardown was not on the critical path; opt-in only
-    if std::env::var_os("DRAIN").is_none() {
-        return;
-    }
-    let items: Vec<(usize, usize)> = std::mem::take(&mut *POOL.lock().unwrap());
-    if items.is_empty() {
-        return;
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..nthreads.max(1) {
-            let (next, items) = (&next, &items);
-            s.spawn(move || loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= items.len() {
-                    break;
-                }
-                unsafe { libc::munmap(items[i].0 as *mut libc::c_void, items[i].1) };
-            });
-        }
-    });
-}
-
-fn map_bytes(bytes: usize) -> *mut u8 {
-    if let Some(p) = pool_take(bytes) {
-        return p;
-    }
-    unsafe {
-        // Large mappings are 2 MB-aligned so transparent huge pages can cover the whole range.
-        let big = bytes >= HUGE_MIN;
-        let ask = if big { bytes + HUGE } else { bytes };
-        let raw = libc::mmap(
-            std::ptr::null_mut(),
-            ask,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | populate(),
-            -1,
-            0,
-        );
-        assert!(raw != libc::MAP_FAILED, "mmap failed for {} bytes", bytes);
-        let mut p = raw;
-        if big {
-            let addr = raw as usize;
-            let aligned = (addr + HUGE - 1) & !(HUGE - 1);
-            if aligned > addr {
-                libc::munmap(raw, aligned - addr);
-            }
-            let tail = addr + ask - (aligned + bytes);
-            if tail > 0 {
-                libc::munmap((aligned + bytes) as *mut libc::c_void, tail);
-            }
-            p = aligned as *mut libc::c_void;
-        }
-        #[cfg(target_os = "linux")]
-        if big {
-            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
-            // MADV_POPULATE_WRITE (Linux 5.14+): fault the whole range in one call, as huge pages where
-            // possible, instead of one trap per 4 KB page. Ignored on older kernels. Opt out with NO_POPULATE.
-            if std::env::var_os("NO_POPULATE").is_none() {
-                libc::madvise(p, bytes, 23);
-            }
-        }
-        p as *mut u8
-    }
-}
-
-impl<T: Copy> HugeVec<T> {
-    pub fn with_capacity(cap: usize) -> Self {
-        let size = std::mem::size_of::<T>().max(1);
-        let raw = cap.max(64) * size;
-        let unit = if raw >= HUGE_MIN { HUGE } else { 4096 };
-        let bytes = (raw + unit - 1) / unit * unit;
-        let ptr = map_bytes(bytes) as *mut T;
-        HugeVec { ptr, len: 0, cap: bytes / size, bytes }
-    }
-    /// Allocates and marks `n` elements as present without initializing them; the caller writes every one.
-    pub fn with_len_uninit(n: usize) -> Self {
-        let mut v = Self::with_capacity(n);
-        v.len = n;
-        v
-    }
-    #[inline(always)]
-    pub fn push(&mut self, v: T) {
-        if self.len == self.cap {
-            self.grow();
-        }
-        unsafe { self.ptr.add(self.len).write(v) };
-        self.len += 1;
-    }
-    #[cold]
-    fn grow(&mut self) {
-        let size = std::mem::size_of::<T>().max(1);
-        let raw = self.cap * 2 * size;
-        let unit = if raw >= HUGE_MIN { HUGE } else { 4096 };
-        let new_bytes = (raw + unit - 1) / unit * unit;
-        let np = map_bytes(new_bytes) as *mut T;
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr, np, self.len);
-        }
-        pool_put(self.ptr as *mut u8, self.bytes);
-        self.ptr = np;
-        self.cap = new_bytes / size;
-        self.bytes = new_bytes;
-    }
-    #[inline(always)]
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.ptr
-    }
-    #[inline(always)]
-    pub fn extend_from_slice(&mut self, src: &[T]) {
-        while self.len + src.len() > self.cap {
-            self.grow();
-        }
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(self.len), src.len()) };
-        self.len += src.len();
-    }
-}
 
 /// One 64-byte staging line.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Line(pub [u8; 64]);
-
-/// Partitioned output of one producer: a fixed-capacity region per partition inside one mapping, plus a
-/// rarely used overflow vector per partition. `get(p)` returns the two slices of partition p.
-pub struct Parts<T: Copy> {
-    arena: HugeVec<T>,
-    cap: usize,
-    lens: Vec<u32>,
-    over: Vec<Vec<T>>,
-}
-unsafe impl<T: Copy + Send> Send for Parts<T> {}
-unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
-impl<T: Copy> Parts<T> {
-    #[inline(always)]
-    pub fn get(&self, p: usize) -> [&[T]; 2] {
-        let a = unsafe { std::slice::from_raw_parts(self.arena.ptr.add(p * self.cap), self.lens[p] as usize) };
-        [a, &self.over[p][..]]
-    }
-    #[inline(always)]
-    pub fn len(&self, p: usize) -> usize {
-        self.lens[p] as usize + self.over[p].len()
-    }
-    pub fn nparts(&self) -> usize {
-        self.lens.len()
-    }
-}
-
-/// Software write-combining scatter into `np` partitions: records are staged four per partition (one or
-/// two 64-byte lines) and streamed out with non-temporal stores, so the parser's output never pollutes the
-/// caches. Four records per flush keeps the flush branch mostly not taken.
-pub struct Scatter<T: Copy> {
-    arena: HugeVec<T>,
-    cap: usize,
-    lens: Vec<u32>,
-    over: Vec<Vec<T>>,
-    stage: Vec<Line>,
-    cnt: Vec<u8>,
-    per: usize,
-    lines: usize, // staging lines per partition
-}
-
-impl<T: Copy + Default> Scatter<T> {
-    /// `est` = expected records per partition; the region holds 5/4 of that (rounded up to whole flushes).
-    pub fn new(np: usize, est: usize) -> Self {
-        let size = std::mem::size_of::<T>();
-        assert!(size > 0 && 64 % size == 0 && size <= 64, "record size must divide 64");
-        let per = 4.max(64 / size);
-        let lines = (per * size + 63) / 64;
-        let cap = ((est + est / 4 + 64) + per - 1) / per * per;
-        Scatter {
-            arena: HugeVec::with_capacity(np * cap),
-            cap,
-            lens: vec![0; np],
-            over: (0..np).map(|_| Vec::new()).collect(),
-            stage: vec![Line([0u8; 64]); np * lines],
-            cnt: vec![0; np],
-            per,
-            lines,
-        }
-    }
-    #[inline(always)]
-    fn stage_ptr(&mut self, p: usize) -> *mut u8 {
-        unsafe { self.stage.as_mut_ptr().add(p * self.lines) as *mut u8 }
-    }
-    #[inline(always)]
-    pub fn push(&mut self, p: usize, v: T) {
-        let c = self.cnt[p] as usize;
-        unsafe {
-            let dst = self.stage_ptr(p).add(c * std::mem::size_of::<T>()) as *mut T;
-            dst.write(v);
-        }
-        if c + 1 == self.per {
-            self.flush(p);
-            self.cnt[p] = 0;
-        } else {
-            self.cnt[p] = (c + 1) as u8;
-        }
-    }
-    #[inline(always)]
-    fn flush(&mut self, p: usize) {
-        let l = self.lens[p] as usize;
-        if l + self.per <= self.cap {
-            unsafe {
-                let dst = (self.arena.ptr.add(p * self.cap + l)) as *mut u8;
-                let src = self.stage_ptr(p) as *const u8;
-                for i in 0..self.lines {
-                    stream64(dst.add(i * 64), src.add(i * 64));
-                }
-            }
-            self.lens[p] = (l + self.per) as u32;
-        } else {
-            let src = unsafe { std::slice::from_raw_parts(self.stage_ptr(p) as *const T, self.per) };
-            self.over[p].extend_from_slice(src);
-        }
-    }
-    pub fn finish(mut self) -> Parts<T> {
-        for p in 0..self.lens.len() {
-            let c = self.cnt[p] as usize;
-            if c > 0 {
-                let src = unsafe { std::slice::from_raw_parts(self.stage_ptr(p) as *const T, c) };
-                let l = self.lens[p] as usize;
-                if l + c <= self.cap {
-                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.arena.ptr.add(p * self.cap + l), c) };
-                    self.lens[p] = (l + c) as u32;
-                } else {
-                    self.over[p].extend_from_slice(src);
-                }
-            }
-        }
-        sfence();
-        Parts { arena: self.arena, cap: self.cap, lens: self.lens, over: self.over }
-    }
-}
 
 /// Copies one 64-byte line with non-temporal stores (dst must be 64-byte aligned).
 #[inline(always)]
@@ -850,6 +571,7 @@ impl<T: Copy> Pool<T> {
         }
         first as u32
     }
+    #[allow(dead_code)]
     pub fn used_records(&self) -> usize {
         self.next.load(std::sync::atomic::Ordering::Relaxed) * CHUNK
     }
@@ -973,6 +695,7 @@ impl<'a, T: Copy> PoolParts<'a, T> {
         self.lists.iter().flat_map(move |l| l[p].iter().map(move |&(s, n)| unsafe { std::slice::from_raw_parts(pool.at(s) as *const T, n as usize) }))
     }
     /// Slices with their first record's global index.
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn runs(&self, p: usize) -> impl Iterator<Item = (u32, &[T])> + '_ {
         let pool = self.pool;

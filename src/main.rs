@@ -147,8 +147,6 @@ struct Ctx {
     ncamp: u16, // id of organic
     camp_names: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
-    nthreads: usize,
-    log_p: u32,
 }
 
 /// Shared raw pointer for disjoint parallel writes.
@@ -1105,7 +1103,7 @@ fn run() {
     let log_p = std::env::var("LOG_P").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| choose_log_p(n_est));
     let np = 1usize << log_p;
     let timing = std::env::var_os("TIMING").is_some();
-    let ctx = Ctx { ws, we, products, campaigns, ncat, cat_names, cat_rank, ncamp, camp_names, channels, nthreads, log_p };
+    let ctx = Ctx { ws, we, products, campaigns, ncat, cat_names, cat_rank, ncamp, camp_names, channels };
     log(&t0, &format!("setup: {} files, {} threads, {} event units, {} partitions", inputs.files.len(), nthreads, inputs.events.len(), np));
 
     // Phase 0: links, parsed by every thread.
