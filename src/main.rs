@@ -402,7 +402,14 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
+        let n = recs.len();
+        for i in 0..n.min(D) {
+            sk.prefetch(recs[i].id.hash(sides));
+        }
         for (i, r) in recs.iter().enumerate() {
+            if i + D < n {
+                sk.prefetch(recs[i + D].id.hash(sides));
+            }
             let h = r.id.hash(sides);
             if sk.count(h) < 2 {
                 if event_ok(r) {
@@ -479,7 +486,15 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<Hu
     let mut used: Vec<bool> = vec![false; cap];
     let mut out: Scatter<ClValid, P> = Scatter::new(total / P + 1024);
     for tv in raws.iter() {
-        for r in tv[p].iter() {
+        let recs = &tv[p][..];
+        let n = recs.len();
+        for i in 0..n.min(D) {
+            sk.prefetch(recs[i].id.hash(sides));
+        }
+        for (i, r) in recs.iter().enumerate() {
+            if i + D < n {
+                sk.prefetch(recs[i + D].id.hash(sides));
+            }
             let h = r.id.hash(sides);
             let fresh = if sk.count(h) < 2 {
                 true
