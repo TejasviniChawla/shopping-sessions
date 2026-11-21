@@ -99,3 +99,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   (1.46 vs 1.33). Cross-runner CI comparisons misled; only same-runner A/B from now on. Reverting src/ to the 4922f03 design.
 - 2026-11-21 ~23:40 ET: same-runner A/B (GNR 6975P-C): a805d87 (per-partition design + post-7526431 improvements) 0.94 s vs
   7526431 1.02-1.06 s => ~9% faster. Recommended a805d87 for the next submission (expected ~1.6 s on the scorer).
+- 2026-11-21 23:30 ET: SCORER: a805d87 = 1.69 s (new best; A/B predicted ~9%, got 6%). perf on CI: user 3.57 s / sys 1.21 s,
+  161k page faults => kernel time ~25% of CPU. Fix in A/B: reuse dedup scratch across partitions, MADV_POPULATE_WRITE after
+  MADV_HUGEPAGE for >=2MB HugeVecs.

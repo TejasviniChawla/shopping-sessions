@@ -216,6 +216,11 @@ fn map_bytes(bytes: usize) -> *mut u8 {
         #[cfg(target_os = "linux")]
         if bytes >= HUGE_MIN {
             libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+            // MADV_POPULATE_WRITE (Linux 5.14+): fault the whole range in one call, as huge pages where
+            // possible, instead of one trap per 4 KB page. Ignored on older kernels. Opt out with NO_POPULATE.
+            if std::env::var_os("NO_POPULATE").is_none() {
+                libc::madvise(p, bytes, 23);
+            }
         }
         p as *mut u8
     }
