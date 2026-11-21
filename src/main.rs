@@ -1053,6 +1053,7 @@ fn run() {
             let ctx = &ctx;
             let (ev_start, cl_start) = (&ev_start, &cl_start);
             let (person_name, user_dir) = (&person_name, &user_dir);
+            let t0 = &t0;
             hs.push(s.spawn(move || {
                 let mut w = Walker::new(ctx, sides, day0, ndays);
                 loop {
@@ -1072,6 +1073,9 @@ fn run() {
                         cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp_bytes(&b.id, sides)));
                         w.walk(p as u32, ev, cl);
                     }
+                }
+                if t == 0 {
+                    eprintln!("[{:7.3}s] thread 0 walk done", t0.elapsed().as_secs_f64());
                 }
                 let n_rows = w.rows.len();
                 if n_rows > 0 || t == 0 {
