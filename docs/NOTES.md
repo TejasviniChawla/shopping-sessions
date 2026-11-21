@@ -57,3 +57,4 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-20 23:20: Python reference (../tools/reference.py) passes 36/36 fixtures; used as an independent oracle on other seeds.
   Added fork-and-exit wrapper (Linux only; NO_FORK=1 disables). Parallel user_daily parts: output phase now ~0.07 s on 10M.
 - 2026-11-20 23:30: reference.py MATCHES dev-answer (seed 1). Binary MATCHES reference on seed 7 (1M). Multi-seed check running.
+- 2026-11-20 23:40: binary MATCHES reference on seeds 2,3,11,23,42,99,123,2028 (200k events each; windows 2025-2028 incl. 2028-01-23 span).
