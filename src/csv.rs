@@ -206,30 +206,105 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
     if cm.count_ones() as usize != N - 1 {
         return false;
     }
-    // One branch-free loop for quoted and unquoted lines. A field is quoted iff its first byte is a quote
-    // and it has at least 2 bytes; the quotes a valid line may contain are exactly the first and last
-    // bytes of its quoted fields, so the line is valid iff that expected quote mask equals `qm`.
-    let mut w = cm;
-    let mut s = 0usize;
-    let mut expect: u128 = 0;
-    for k in 0..N {
-        let e = if k == N - 1 {
-            n
-        } else {
+    if qm == 0 {
+        // fast path: no quotes; comma positions from the two 64-bit halves
+        let mut s = 0usize;
+        let mut k = 0;
+        let mut w = cm as u64;
+        while w != 0 {
             let e = w.trailing_zeros() as usize;
-            w &= w.wrapping_sub(1);
-            e
-        };
-        let len = e - s;
-        let first = if len >= 1 { unsafe { *line.get_unchecked(s) } } else { 0 };
-        let o = ((first == b'"') & (len >= 2)) as usize;
-        expect |= ((o as u128) << (s & 127)) | ((o as u128) << (e.wrapping_sub(1) & 127));
+            w &= w - 1;
+            out[k] = unsafe { line.get_unchecked(s..e) };
+            s = e + 1;
+            k += 1;
+        }
+        let mut w = (cm >> 64) as u64;
+        while w != 0 {
+            let e = 64 + w.trailing_zeros() as usize;
+            w &= w - 1;
+            out[k] = unsafe { line.get_unchecked(s..e) };
+            s = e + 1;
+            k += 1;
+        }
+        out[N - 1] = unsafe { line.get_unchecked(s..n) };
+        return true;
+    }
+    // quotes: a quote is valid only as the first and last byte of a field of length >= 2.
+    // Per non-empty field, extract its open and close bits with pext (one bit per field, in field order);
+    // the line is valid iff the two patterns agree. Empty fields have no first/last byte and no quotes.
+    let starts = (cm << 1) | 1;
+    let ends = (cm >> 1) | (1u128 << (n - 1));
+    let open = qm & starts;
+    let close = qm & ends;
+    if (open | close) != qm || (open & close) != 0 {
+        return false;
+    }
+    let c = cm | (1u128 << n);
+    let starts_ne = starts & !c;
+    let ends_ne = ends & !cm;
+    let ob = pext128(open, starts_ne);
+    let cb = pext128(close, ends_ne);
+    if ob != cb {
+        return false;
+    }
+    // field end positions from the two 64-bit halves (no 128-bit shifts in the loop)
+    let mut ends_pos = [0usize; N];
+    let mut k = 0;
+    let mut w = cm as u64;
+    while w != 0 {
+        ends_pos[k] = w.trailing_zeros() as usize;
+        w &= w - 1;
+        k += 1;
+    }
+    let mut w = (cm >> 64) as u64;
+    while w != 0 {
+        ends_pos[k] = 64 + w.trailing_zeros() as usize;
+        w &= w - 1;
+        k += 1;
+    }
+    ends_pos[N - 1] = n;
+    let mut s = 0usize;
+    let mut ob = ob as u32;
+    for k in 0..N {
+        let e = ends_pos[k];
+        let ne = (e > s) as u32;
+        let o = (ob & ne) as usize;
+        ob >>= ne;
         out[k] = unsafe { line.get_unchecked(s + o..e - o) };
         s = e + 1;
     }
-    expect == qm
+    true
 }
 
+/// Parallel bit extract over 128 bits: hardware `pext` on x86-64 with BMI2, software elsewhere.
+#[inline(always)]
+fn pext128(x: u128, m: u128) -> u128 {
+    let lo = pext64(x as u64, m as u64);
+    let hi = pext64((x >> 64) as u64, (m >> 64) as u64);
+    let nlo = (m as u64).count_ones();
+    (lo as u128) | ((hi as u128) << nlo)
+}
+
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        return unsafe { std::arch::x86_64::_pext_u64(x, m) };
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut m = m;
+        let mut r = 0u64;
+        let mut k = 0;
+        while m != 0 {
+            let b = m & m.wrapping_neg();
+            r |= ((x & b != 0) as u64) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        r
+    }
+}
 
 /// Line scanner that finds the newline with the same SIMD pass that produces the comma/quote masks.
 /// Requires 128 bytes of readable padding after `end` in `buf`.
