@@ -975,9 +975,7 @@ fn run() {
         let b = PKey::new(f[1], aid, side);
         // the mirrored copy goes to b's partition so every partition sees all of its own IDs locally
         let (pa, pb) = (part(a.hash_in(side)), part(b.hash_in(side)));
-        if pa != pb {
-            extra.push(pb, LinkRaw { a: b, b: a });
-        }
+        extra.push(pb, LinkRaw { a: b, b: a });
         Some((pa, LinkRaw { a, b }))
     });
     log(&t0, "clicks+links parsed");
