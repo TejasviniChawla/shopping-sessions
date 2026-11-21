@@ -101,8 +101,11 @@ jobs:
           sudo rm -rf /tmp/out/* ; mkdir -p /tmp/out2
           DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf stat -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,LLC-load-misses,page-faults /tmp/shopsess 2>&1 | tail -25 || true
           rm -rf /tmp/out2; mkdir -p /tmp/out2
-          DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf record -q -F 2000 -g -o /tmp/perf.data /tmp/shopsess 2>/dev/null || true
-          perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -vE "^#|^$" | head -40 || true
+          # unstripped native build for symbolized profiles
+          RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -q --target-dir /tmp/perfbuild 2>&1 | tail -3 || true
+          PB=/tmp/perfbuild/release/shopsess; [ -x $PB ] || PB=/tmp/shopsess
+          DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf record -q -F 4000 -o /tmp/perf.data $PB 2>/dev/null || true
+          echo "== hot symbols (self)"; perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -vE "^#|^$" | head -45 || true
       - name: Native timing of main vs comparison binary (process exit included, docker excluded)
         if: ${{ github.event.inputs.compare != '' }}
         run: |
