@@ -331,6 +331,13 @@ impl Sketch {
         let slots = (total * 32).max(1024).next_power_of_two();
         Sketch { words: vec![0u64; slots / 32], mask: slots - 1 }
     }
+    /// Reuse an existing buffer (no fresh page faults): resize and clear.
+    fn reuse(mut words: Vec<u64>, total: usize) -> Self {
+        let slots = (total * 32).max(1024).next_power_of_two();
+        words.clear();
+        words.resize(slots / 32, 0);
+        Sketch { words, mask: slots - 1 }
+    }
     #[inline(always)]
     fn bump(&mut self, h: u64) {
         let slot = (h as usize) & self.mask;
@@ -364,12 +371,23 @@ static DEDUP_NS: [std::sync::atomic::AtomicU64; 4] = [
 ];
 
 /// Per partition p: dedup event copies by event_id keeping min ingest, validate, scatter by user hash.
-fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<HugeVec<EvValid>> {
+/// Per-thread scratch reused across partition tasks so the kernel does not fault fresh pages 32 times per phase.
+#[derive(Default)]
+struct Scratch {
+    sketch: Vec<u64>,
+    slots: Vec<(u32, PKey)>,
+    win: Vec<u64>,
+    cands: Vec<u32>,
+    used: Vec<bool>,
+    ckeys: Vec<PKey>,
+}
+
+fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, sc: &mut Scratch) -> Vec<HugeVec<EvValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     const D: usize = 16;
     let tp = Instant::now();
     // pass 1: count sketch
-    let mut sk = Sketch::new(total);
+    let mut sk = Sketch::reuse(std::mem::take(&mut sc.sketch), total);
     for tv in raws.iter() {
         let recs = &tv[p][..];
         let n = recs.len();
@@ -389,7 +407,8 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
     let skip_emit = std::env::var_os("DEDUP_SKIP_EMIT").is_some();
     let skip_cands = std::env::var_os("DEDUP_SKIP_CANDS").is_some();
     let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
-    let mut cands: Vec<u32> = Vec::with_capacity(total / 8 + 64);
+    let mut cands: Vec<u32> = std::mem::take(&mut sc.cands);
+    cands.clear();
     let mut off = vec![0usize; raws.len() + 1];
     for t in 0..raws.len() {
         off[t + 1] = off[t] + raws[t][p].len();
@@ -420,8 +439,12 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
     // pass 3: exact table over candidates only (min ingest wins), slot prefetched D ahead
     let cap = (cands.len() * 2).max(64).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: Vec<(u32, PKey)> = vec![(u32::MAX, PKey(0)); cap];
-    let mut win = vec![0u64; (total + 63) / 64 + 1];
+    let mut slots = std::mem::take(&mut sc.slots);
+    slots.clear();
+    slots.resize(cap, (u32::MAX, PKey(0)));
+    let mut win = std::mem::take(&mut sc.win);
+    win.clear();
+    win.resize((total + 63) / 64 + 1, 0);
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     let nc = cands.len();
     for k in 0..nc.min(D) {
@@ -469,13 +492,17 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
     }
     let o = out.finish();
     DEDUP_NS[2].fetch_add(tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    sc.sketch = sk.words;
+    sc.slots = slots;
+    sc.win = win;
+    sc.cands = cands;
     o
 }
 
-fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
+fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize, sc: &mut Scratch) -> Vec<HugeVec<ClValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     const D: usize = 16;
-    let mut sk = Sketch::new(total);
+    let mut sk = Sketch::reuse(std::mem::take(&mut sc.sketch), total);
     for tv in raws.iter() {
         let recs = &tv[p][..];
         let n = recs.len();
@@ -491,8 +518,12 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<Hu
     }
     let cap = (total / 4).max(64).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: Vec<PKey> = vec![PKey(0); cap];
-    let mut used: Vec<bool> = vec![false; cap];
+    let mut slots = std::mem::take(&mut sc.ckeys);
+    slots.clear();
+    slots.resize(cap, PKey(0));
+    let mut used = std::mem::take(&mut sc.used);
+    used.clear();
+    used.resize(cap, false);
     let mut out: Scatter<ClValid, P> = Scatter::new(total / P + 1024);
     for tv in raws.iter() {
         let recs = &tv[p][..];
@@ -526,6 +557,9 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<Hu
             }
         }
     }
+    sc.sketch = sk.words;
+    sc.ckeys = slots;
+    sc.used = used;
     out.finish()
 }
 
@@ -1010,17 +1044,20 @@ fn run() {
                 let next = &next;
                 let ev_raw = &ev_raw;
                 let cl_raw = &cl_raw;
-                s.spawn(move || loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= 2 * P {
-                        break;
-                    }
-                    if i < P {
-                        let r = dedup_events(sides, ev_raw, i);
-                        unsafe { *evp.p().add(i) = Some(r) };
-                    } else {
-                        let r = dedup_clicks(sides, cl_raw, i - P);
-                        unsafe { *clp.p().add(i - P) = Some(r) };
+                s.spawn(move || {
+                    let mut sc = Scratch::default();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= 2 * P {
+                            break;
+                        }
+                        if i < P {
+                            let r = dedup_events(sides, ev_raw, i, &mut sc);
+                            unsafe { *evp.p().add(i) = Some(r) };
+                        } else {
+                            let r = dedup_clicks(sides, cl_raw, i - P, &mut sc);
+                            unsafe { *clp.p().add(i - P) = Some(r) };
+                        }
                     }
                 });
             }
