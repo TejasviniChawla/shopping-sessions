@@ -97,3 +97,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   Earlier 8370C runs: 1.58 (first), 1.46-1.51 (P=32 build). Submitted d200c39 as the second practice run.
 - 2026-11-21 ~23:20 ET: SCORER: d200c39 (global user table restructure) = 2.17 s, WORSE than 7526431 (1.79 s). Zen3 CI agreed
   (1.46 vs 1.33). Cross-runner CI comparisons misled; only same-runner A/B from now on. Reverting src/ to the 4922f03 design.
+- 2026-11-21 ~23:40 ET: same-runner A/B (GNR 6975P-C): a805d87 (per-partition design + post-7526431 improvements) 0.94 s vs
+  7526431 1.02-1.06 s => ~9% faster. Recommended a805d87 for the next submission (expected ~1.6 s on the scorer).
