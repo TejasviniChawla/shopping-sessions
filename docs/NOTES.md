@@ -154,3 +154,9 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   in-process 0.57 vs 0.61. Stages (4 thr): parse+linkmap 0.27 (old parse 0.24: still faster), dedup+click parse 0.15,
   click dedup 0.025, persons+parquet 0.12. LOG_P sweep native: 6: 0.60, 7: 0.59, 8/9/10: 0.565-0.58 -> keep 8.
   Next: symbolized perf profile (workflow now builds unstripped native binary), then parse hot spots.
+- 2026-11-21 ~03:30 ET: main fast-forwarded to v3 (c281c15). Source-line profile: no line > 4%; link-map bit filter stall
+  ~4.5%, pack8 table lookups ~3.6%, hash ~2.3%, ts SWAR ~3.3%, split ~3%, sorts ~3%, snappy+pq ~3%, kernel ~8%.
+  6a56d39 (no filter, 1-multiply hash, SWAR digits8 with exhaustive test) vs c281c15 on Granite Rapids 6975P (4 vCPU 10M):
+  WIN 0.85/0.86 vs 0.91/0.93 wall; in-process 0.74 vs 0.80 (parse .355/.37, dedup .19/.24, persons .155/.165).
+  7709e08 direct-index Lookup for p<n>/c_<n>; 6b789aa precomputed click lex key for the click sort. Ten seeds MATCH (8/10 in).
+  Output at 10M: 12 MB (user_id dict+snappy 1.4 MB/part of 3 MB). 30M scaling run dispatched.
