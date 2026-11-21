@@ -215,11 +215,19 @@ fn parse_event_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: 
     if !f[5].is_empty() {
         flags |= 4;
     }
-    let etype: u8 = match f[4] {
-        b"view" => 0,
-        b"cart" => 1,
-        b"purchase" => 2,
-        _ => 3,
+    let etype: u8 = {
+        let t = f[4];
+        // over-read is safe: the line sits in a padded buffer
+        let w = unsafe { std::ptr::read_unaligned(t.as_ptr() as *const u64) };
+        if t.len() == 4 && (w as u32) == u32::from_le_bytes(*b"view") {
+            0
+        } else if t.len() == 4 && (w as u32) == u32::from_le_bytes(*b"cart") {
+            1
+        } else if t.len() == 8 && w == u64::from_le_bytes(*b"purchase") {
+            2
+        } else {
+            3
+        }
     };
     flags |= etype << 4;
     let mut price = 0u32;
@@ -566,7 +574,7 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize, sc: &mut 
 // ---------- user interning ----------
 
 struct Intern {
-    slots: Vec<u32>,
+    slots: HugeVec<u32>,
     keys: Vec<PKey>,
     mask: usize,
 }
@@ -574,12 +582,15 @@ struct Intern {
 impl Intern {
     fn new(est: usize) -> Self {
         let cap = (est * 2).max(64).next_power_of_two();
-        Intern { slots: vec![u32::MAX; cap], keys: Vec::with_capacity(est), mask: cap - 1 }
+        let mut slots: HugeVec<u32> = HugeVec::with_len_uninit(cap);
+        slots.fill(u32::MAX);
+        Intern { slots, keys: Vec::with_capacity(est), mask: cap - 1 }
     }
     fn grow(&mut self, sides: &Sides) {
         let cap = self.slots.len() * 2;
         let mask = cap - 1;
-        let mut slots = vec![u32::MAX; cap];
+        let mut slots: HugeVec<u32> = HugeVec::with_len_uninit(cap);
+        slots.fill(u32::MAX);
         for (i, k) in self.keys.iter().enumerate() {
             let mut s = (k.hash(sides) as usize) & mask;
             while slots[s] != u32::MAX {
