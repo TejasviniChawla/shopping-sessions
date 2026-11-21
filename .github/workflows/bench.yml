@@ -105,7 +105,8 @@ jobs:
           RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -q --target-dir /tmp/perfbuild 2>&1 | tail -3 || true
           PB=/tmp/perfbuild/release/shopsess; [ -x $PB ] || PB=/tmp/shopsess
           DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf record -q -F 4000 -o /tmp/perf.data $PB 2>/dev/null || true
-          echo "== hot symbols (self)"; perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -vE "^#|^$" | head -45 || true
+          echo "== hot symbols (self)"; perf report -i /tmp/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -vE "^#|^$" | head -30 || true
+          echo "== hot source lines (self)"; perf report -i /tmp/perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -vE "^#|^$" | head -70 || true
       - name: Native timing of main vs comparison binary (process exit included, docker excluded)
         if: ${{ github.event.inputs.compare != '' }}
         run: |
