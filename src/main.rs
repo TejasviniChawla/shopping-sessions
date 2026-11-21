@@ -447,6 +447,30 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, sc: &mut 
     DEDUP_NS[3].fetch_add(cands.len() as u64, Ordering::Relaxed);
     let tp = Instant::now();
     // pass 3: exact table over candidates only (min ingest wins), slot prefetched D ahead
+    // Order candidates by their table slot (16-bit counting sort on the high hash bits) so the exact-table
+    // probes below walk memory sequentially instead of missing on every access.
+    if cands.len() > 4096 {
+        let mut keyed: Vec<(u32, u32)> = Vec::with_capacity(cands.len());
+        for &pk in &cands {
+            let r = &raws[(pk >> 27) as usize][p][(pk & 0x7FF_FFFF) as usize];
+            keyed.push(((r.id.hash(sides) >> 48) as u32, pk));
+        }
+        let mut counts = vec![0u32; 1 << 16];
+        for &(k, _) in &keyed {
+            counts[k as usize] += 1;
+        }
+        let mut sum = 0u32;
+        for c in counts.iter_mut() {
+            let v = *c;
+            *c = sum;
+            sum += v;
+        }
+        for &(k, pk) in &keyed {
+            let d = counts[k as usize];
+            counts[k as usize] += 1;
+            cands[d as usize] = pk;
+        }
+    }
     let cap = (cands.len() * 2).max(64).next_power_of_two();
     let mask = cap - 1;
     let mut slots = std::mem::take(&mut sc.slots);
@@ -458,17 +482,17 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize, sc: &mut 
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
     let nc = cands.len();
     for k in 0..nc.min(D) {
-        prefetch(unsafe { slots.as_ptr().add((get(cands[k]).id.hash(sides) as usize) & mask) });
+        prefetch(unsafe { slots.as_ptr().add(((get(cands[k]).id.hash(sides) >> 32) as usize) & mask) });
     }
     for k in 0..nc {
         if k + D < nc {
-            prefetch(unsafe { slots.as_ptr().add((get(cands[k + D]).id.hash(sides) as usize) & mask) });
+            prefetch(unsafe { slots.as_ptr().add(((get(cands[k + D]).id.hash(sides) >> 32) as usize) & mask) });
         }
         let packed = cands[k];
         let r = get(packed);
         let h = r.id.hash(sides);
         let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
-        let mut s = (h as usize) & mask;
+        let mut s = ((h >> 32) as usize) & mask;
         loop {
             let (cur, ck) = slots[s];
             if cur == u32::MAX {

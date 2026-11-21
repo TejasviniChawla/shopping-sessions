@@ -85,7 +85,8 @@ pub unsafe fn masks3(p: *const u8) -> (u128, u128, u128) {
         static USE512: AtomicU8 = AtomicU8::new(0);
         let mut f = USE512.load(Ordering::Relaxed);
         if f == 0 {
-            f = if std::env::var_os("NO_AVX512").is_none() && is_x86_feature_detected!("avx512bw") { 2 } else { 1 };
+            // AVX-512 showed no gain over AVX2 on CI and can lower core frequency on Cascade Lake: opt-in via AVX512=1
+            f = if std::env::var_os("AVX512").is_some() && is_x86_feature_detected!("avx512bw") { 2 } else { 1 };
             USE512.store(f, Ordering::Relaxed);
         }
         if f == 2 {
