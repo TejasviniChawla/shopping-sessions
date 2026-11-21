@@ -132,16 +132,16 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~10:30 ET: PGO A/B vs plain 4a83518 on one runner: 0.806-0.813 vs 0.839-0.861 (-5%). 3M vs 1M training: identical.
   Recommended: 2bf102e (or 1627d27, equivalent). Plateau of this architecture on Zen4-4vCPU-10M ~0.80 s in-container.
   Dropped ideas: stamp-value cache (shuffled input, 1.2M distinct seconds -> no locality), 28-byte raw records (~1%).
-- 2026-11-22 ~12:00 ET: SURVEY of fast public entries (Xero 0.90, Eagle Eye 0.94, Teti 1.01): 3 materializations, person resolved
+- 2026-11-21 ~00:00 ET (clock corrected from CI timestamps): SURVEY of fast public entries (Xero 0.90, Eagle Eye 0.94, Teti 1.01): 3 materializations, person resolved
   at dedup time via flat prefetched link-id map + negative filter (no intern phase), u64 order-preserving keys, mmap input
   (scorer /data reportedly tmpfs), hand-rolled uncompressed parquet, _exit. Branch v3 = restructure to that shape.
-- 2026-11-22 ~12:40 ET: v3 landed on branch v3 (047e9a1): parse -> 32 B raw by event id -> dedup resolves person via LinkMap
+- 2026-11-21 ~00:40 ET: v3 landed on branch v3 (047e9a1): parse -> 32 B raw by event id -> dedup resolves person via LinkMap
   (flat open-addressed key->name + bit filter, prefetched) and emits 16 B PRec by person -> person partition does local ids,
   counting sort, per-person sort+walk, per-thread parquet. Fallback (non-packable) IDs now go to a global mutex registry, so
   PKey compares by u64 only (no Side tables). 36/36 fixtures, dev MATCH. Mac stage log 10M: parse 0.46, dedup 0.17, click
   dedup 0.02, persons 0.10, total 0.76 s (v2 1.10 s same run). CI A/B vs 2bf102e: run 44877150577. Ten-seed check running.
   Old main.rs saved as docs/main_v2_final_backup.rs.txt.
-- 2026-11-22 ~13:30 ET: CI A/B of first v3 (047e9a1) vs 2bf102e: LOSS 1.23-1.26 vs 1.18-1.21 wall (Zen3 4 vCPU 10M). Stage
+- 2026-11-21 ~01:30 ET: CI A/B of first v3 (047e9a1) vs 2bf102e: LOSS 1.23-1.26 vs 1.18-1.21 wall (Zen3 4 vCPU 10M). Stage
   compare: v3 saved intern+persons (-0.10) but parse +0.06 (link-map thread oversubscribed) and dedup +0.05. v3 ten seeds MATCH.
   Second survey (top repos: hansliu-dev/676767 = team 67 0.59 s; Dremix10 C++ 0.66 s; zlyuan9 0.37-0.44 s native 20M with
   dedup 50 ms / persons 75 ms): the fast entries use 1024-2048 partitions so dedup tables sit in L2, 64 B write-combining
@@ -150,7 +150,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   (Parts<T> readers), dedup = per-partition sub-buckets (~8k recs) with one L2 table, no sketch; link map built as task 0 of
   the event-parse queue. Mac 10M: LOG_P=6 0.49 s total (parse 0.255!), 8: 0.67, 10: 1.08 -> fewer write streams win on the
   Mac; CI sweep LOG_P 6/7/8(default)/9/10 + A/B vs 2bf102e: run 44878125122. Fixtures 36/36, dev MATCH at 6 and 10.
-- 2026-11-22 ~14:00 ET: CI A/B 4145b80 vs 2bf102e on Zen4 9V45 (4 vCPU, 10M): WIN 0.73/0.75 vs 0.78/0.79/0.82 wall;
+- 2026-11-21 ~02:00 ET: CI A/B 4145b80 vs 2bf102e on Zen4 9V45 (4 vCPU, 10M): WIN 0.73/0.75 vs 0.78/0.79/0.82 wall;
   in-process 0.57 vs 0.61. Stages (4 thr): parse+linkmap 0.27 (old parse 0.24: still faster), dedup+click parse 0.15,
   click dedup 0.025, persons+parquet 0.12. LOG_P sweep native: 6: 0.60, 7: 0.59, 8/9/10: 0.565-0.58 -> keep 8.
   Next: symbolized perf profile (workflow now builds unstripped native binary), then parse hot spots.

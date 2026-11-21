@@ -11,7 +11,7 @@ mod ts;
 mod util;
 
 use csv::{split_scanned, Lines, Scanner};
-use io::{Buffer, Unit};
+use io::Buffer;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -1088,7 +1088,12 @@ fn run() {
                                     }
                                 }
                             }
+                            let t_links = Instant::now();
+                            let n_links = links.len();
                             let lm = build_link_map(&links);
+                            if std::env::var_os("QUIET").is_none() {
+                                eprintln!("    link task: {} links, map built in {:.3}s", n_links, t_links.elapsed().as_secs_f64());
+                            }
                             unsafe { *lm_ptr.p() = Some(lm) };
                         } else if i - 1 < inputs.events.len() {
                             let u = inputs.events[i - 1];
