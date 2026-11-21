@@ -150,3 +150,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   (Parts<T> readers), dedup = per-partition sub-buckets (~8k recs) with one L2 table, no sketch; link map built as task 0 of
   the event-parse queue. Mac 10M: LOG_P=6 0.49 s total (parse 0.255!), 8: 0.67, 10: 1.08 -> fewer write streams win on the
   Mac; CI sweep LOG_P 6/7/8(default)/9/10 + A/B vs 2bf102e: run 44878125122. Fixtures 36/36, dev MATCH at 6 and 10.
+- 2026-11-22 ~14:00 ET: CI A/B 4145b80 vs 2bf102e on Zen4 9V45 (4 vCPU, 10M): WIN 0.73/0.75 vs 0.78/0.79/0.82 wall;
+  in-process 0.57 vs 0.61. Stages (4 thr): parse+linkmap 0.27 (old parse 0.24: still faster), dedup+click parse 0.15,
+  click dedup 0.025, persons+parquet 0.12. LOG_P sweep native: 6: 0.60, 7: 0.59, 8/9/10: 0.565-0.58 -> keep 8.
+  Next: symbolized perf profile (workflow now builds unstripped native binary), then parse hot spots.
