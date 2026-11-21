@@ -32,3 +32,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 ## Status log
 - 2026-11-20: read spec/starters/generator; research done (docs/research.md); dev set generated at ../dev (92 MB);
   venv at ../.venv with polars for the checker scripts. Scaffolded crate.
+- 2026-11-20 20:20: first full Rust pipeline passes 36/36 fixtures and MATCHES dev-answer exactly.
+  Local (M-series, 8 threads) 1M events: ~0.25-0.30 s wall. Bug fixed: partition-local uid needed base[q] offset.

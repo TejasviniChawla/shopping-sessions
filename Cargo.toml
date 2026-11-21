@@ -1,8 +1,18 @@
 [package]
 name = "shopsess"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-memchr = "2.8.3"
-memmap2 = "0.9.12"
+memchr = "2"
+memmap2 = "0.9"
+arrow-array = "60"
+arrow-schema = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
