@@ -198,3 +198,8 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 ~10:30 ET: main f616eb8 at 60M (seed 13) on Zen4 9V74 (4 thr): in-process 4.5-5.4 s (parse 2.3-3.1, cold
   page cache on first runs), wall 4.97-5.91 s; 58.9M events, 14.8M clicks, 6.59M user rows; no OOM. 1024 partitions ->
   ~57k records/partition, dedup table 2 MB (L3) still fine.
+- 2026-11-21 ~10:45 ET: early-exit build ten seeds MATCH -> main fast-forwarded to 7329bcc = RECOMMENDED submission and
+  final pick. Verified: 36/36 fixtures, dev MATCH, ten seeds, 30M and 60M CI runs. Same-runner chain of wins over 574a577
+  (board 1.62 s): v3 restructure -6%, micro batch -7%, two-round -2.5%, early-exit -2.5% (compounded ~ -17%).
+  Remaining ideas all <= 2% (below single-A/B noise). Reminder: the final retimes the EXPLICITLY picked commit; the default
+  is the best practice score, so pick 7329bcc on the track page.
