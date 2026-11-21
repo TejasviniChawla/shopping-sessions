@@ -177,3 +177,111 @@ mod tests {
         assert_eq!(long1.cmp_bytes(&long3, &arenas), std::cmp::Ordering::Less);
     }
 }
+
+/// A growable array backed by anonymous mmap with transparent huge pages requested (Linux).
+/// Fewer first-touch page faults than malloc for multi-hundred-MB vectors, and cheap teardown.
+pub struct HugeVec<T> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+unsafe impl<T: Send> Send for HugeVec<T> {}
+unsafe impl<T: Sync> Sync for HugeVec<T> {}
+
+const HUGE: usize = 2 << 20;
+
+fn map_bytes(bytes: usize) -> *mut u8 {
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert!(p != libc::MAP_FAILED, "mmap failed for {} bytes", bytes);
+        #[cfg(target_os = "linux")]
+        {
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        }
+        p as *mut u8
+    }
+}
+
+impl<T: Copy> HugeVec<T> {
+    pub fn with_capacity(cap: usize) -> Self {
+        let size = std::mem::size_of::<T>().max(1);
+        let bytes = (cap.max(64) * size + HUGE - 1) / HUGE * HUGE;
+        let ptr = map_bytes(bytes) as *mut T;
+        HugeVec { ptr, len: 0, cap: bytes / size }
+    }
+    /// Allocates and marks `n` elements as present without initializing them; the caller writes every one.
+    pub fn with_len_uninit(n: usize) -> Self {
+        let mut v = Self::with_capacity(n);
+        v.len = n;
+        v
+    }
+    #[inline(always)]
+    pub fn push(&mut self, v: T) {
+        if self.len == self.cap {
+            self.grow();
+        }
+        unsafe { self.ptr.add(self.len).write(v) };
+        self.len += 1;
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let size = std::mem::size_of::<T>().max(1);
+        let new_bytes = (self.cap * 2 * size + HUGE - 1) / HUGE * HUGE;
+        let np = map_bytes(new_bytes) as *mut T;
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr, np, self.len);
+            libc::munmap(self.ptr as *mut libc::c_void, self.cap * size);
+        }
+        self.ptr = np;
+        self.cap = new_bytes / size;
+    }
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+}
+
+impl<T> std::ops::Deref for HugeVec<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl<T> std::ops::DerefMut for HugeVec<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+impl<T> Drop for HugeVec<T> {
+    fn drop(&mut self) {
+        let size = std::mem::size_of::<T>().max(1);
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.cap * size);
+        }
+    }
+}
+
+#[inline(always)]
+pub fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = p;
+    }
+}

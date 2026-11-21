@@ -6,13 +6,13 @@ mod out;
 mod ts;
 mod util;
 
-use csv::{split_fields, Lines};
+use csv::{split_fields, split_scanned, Lines, Scanner};
 use io::{Buffer, Unit};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
-use util::{key_hash, Arenas, Key, SmallTable};
+use util::{key_hash, prefetch, Arenas, HugeVec, Key, SmallTable};
 
 const LOG_P: u32 = 4;
 const P: usize = 1 << LOG_P;
@@ -204,9 +204,9 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 #[inline(always)]
-fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> Option<EvRaw> {
+fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8], masks: Option<(u128, u128)>) -> Option<EvRaw> {
     let mut f = [&b""[..]; 7];
-    if !split_fields(line, &mut f) || f[0].is_empty() {
+    if !split_scanned(line, masks, &mut f) || f[0].is_empty() {
         return None;
     }
     let ingest = match parse_f1(f[3]) {
@@ -251,9 +251,9 @@ fn parse_event_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> 
 }
 
 #[inline(always)]
-fn parse_click_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8]) -> Option<ClRaw> {
+fn parse_click_line(ctx: &Ctx, aid: usize, arena: &mut Vec<u8>, line: &[u8], masks: Option<(u128, u128)>) -> Option<ClRaw> {
     let mut f = [&b""[..]; 4];
-    if !split_fields(line, &mut f) || f[0].is_empty() {
+    if !split_scanned(line, masks, &mut f) || f[0].is_empty() {
         return None;
     }
     let mut flags = 0u8;
@@ -283,14 +283,14 @@ fn parse_parallel<T: Copy + Send, F>(
     units: &[Unit],
     arena_base: usize,
     f: F,
-) -> (Vec<Vec<Vec<T>>>, Vec<Vec<u8>>)
+) -> (Vec<Vec<HugeVec<T>>>, Vec<Vec<u8>>)
 where
-    F: Fn(&Ctx, usize, &mut Vec<u8>, &[u8]) -> Option<(usize, T)> + Sync,
+    F: Fn(&Ctx, usize, &mut Vec<u8>, &[u8], Option<(u128, u128)>) -> Option<(usize, T)> + Sync,
 {
     let next = AtomicUsize::new(0);
     let total_bytes: u64 = units.iter().map(|u| u.end - u.start).sum();
-    let est = (total_bytes / 70) as usize / ctx.nthreads / P + 16;
-    let results: Vec<(Vec<Vec<T>>, Vec<u8>)> = std::thread::scope(|s| {
+    let est = (total_bytes / 60) as usize / ctx.nthreads / P + 1024;
+    let results: Vec<(Vec<HugeVec<T>>, Vec<u8>)> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for t in 0..ctx.nthreads {
             let next = &next;
@@ -298,7 +298,7 @@ where
             handles.push(s.spawn(move || {
                 let aid = arena_base + t;
                 let mut arena: Vec<u8> = Vec::new();
-                let mut out: Vec<Vec<T>> = (0..P).map(|_| Vec::with_capacity(est)).collect();
+                let mut out: Vec<HugeVec<T>> = (0..P).map(|_| HugeVec::with_capacity(est)).collect();
                 let mut buf = Buffer::new();
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -309,8 +309,9 @@ where
                     buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
                     let (lo, hi) = (buf.lo, buf.hi);
                     let data = buf.data();
-                    for line in Lines::new(data, lo, hi) {
-                        if let Some((p, rec)) = f(ctx, aid, &mut arena, line) {
+                    let mut sc = Scanner::new(data, lo, hi);
+                    while let Some((line, masks)) = sc.next() {
+                        if let Some((p, rec)) = f(ctx, aid, &mut arena, line, masks) {
                             out[p].push(rec);
                         }
                     }
@@ -332,53 +333,74 @@ where
 // ---------- dedup ----------
 
 /// Per partition p: dedup event copies by event_id keeping min ingest, validate, scatter by user hash.
-fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<Vec<EvRaw>>], p: usize) -> Vec<Vec<EvValid>> {
+fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<HugeVec<EvValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     let cap = (total * 2).max(16).next_power_of_two();
     let mask = cap - 1;
-    // slot -> (packed record index, hash) ; hash stored to avoid touching records on probe misses
-    let mut slots: Vec<(u32, u64)> = vec![(u32::MAX, 0); cap];
+    // slot -> (packed record index, hash); hash stored to avoid touching records on probe misses
+    let mut slots: HugeVec<(u32, u64)> = HugeVec::with_len_uninit(cap);
+    for s in slots.iter_mut() {
+        *s = (u32::MAX, 0);
+    }
     let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
+    // dense offsets per thread vector for the winner bitmap
+    let mut off = vec![0usize; raws.len() + 1];
+    for t in 0..raws.len() {
+        off[t + 1] = off[t] + raws[t][p].len();
+    }
+    let mut win = vec![0u64; (total + 63) / 64 + 1];
+    const D: usize = 8;
     for (t, tv) in raws.iter().enumerate() {
-        for (i, r) in tv[p].iter().enumerate() {
+        let recs = &tv[p][..];
+        let n = recs.len();
+        let mut hs = [0u64; D];
+        for i in 0..n.min(D) {
+            let h = key_hash(&recs[i].id, files);
+            hs[i] = h;
+            prefetch(unsafe { slots.as_ptr().add((h as usize) & mask) });
+        }
+        for i in 0..n {
+            let r = &recs[i];
+            let h = hs[i % D];
+            if i + D < n {
+                let h2 = key_hash(&recs[i + D].id, files);
+                hs[i % D] = h2;
+                prefetch(unsafe { slots.as_ptr().add((h2 as usize) & mask) });
+            }
             let packed = ((t as u32) << 27) | (i as u32);
-            let h = key_hash(&r.id, files);
+            let dense = off[t] + i;
             let mut s = (h as usize) & mask;
             loop {
                 let (cur, ch) = slots[s];
                 if cur == u32::MAX {
                     slots[s] = (packed, h);
+                    win[dense >> 6] |= 1 << (dense & 63);
                     break;
                 }
-                if ch == h && get(cur).id.same(&r.id, files) {
+                if ch == h {
                     let o = get(cur);
-                    if r.ingest < o.ingest {
-                        slots[s] = (packed, h);
+                    if o.id.same(&r.id, files) {
+                        if r.ingest < o.ingest {
+                            slots[s] = (packed, h);
+                            let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
+                            win[od >> 6] &= !(1 << (od & 63));
+                            win[dense >> 6] |= 1 << (dense & 63);
+                        }
+                        break;
                     }
-                    break;
                 }
                 s = (s + 1) & mask;
             }
         }
     }
-    let mut out: Vec<Vec<EvValid>> = (0..P).map(|_| Vec::with_capacity(total / P + 16)).collect();
-    // Second pass in record order (sequential memory): a record wins if its slot still holds it.
+    drop(slots);
+    let mut out: Vec<HugeVec<EvValid>> = (0..P).map(|_| HugeVec::with_capacity(total / P + 1024)).collect();
+    // Second pass in record order: winners by bitmap, then validate and scatter by user hash.
     for (t, tv) in raws.iter().enumerate() {
-        for (i, r) in tv[p].iter().enumerate() {
-            let packed = ((t as u32) << 27) | (i as u32);
-            let h = key_hash(&r.id, files);
-            let mut s = (h as usize) & mask;
-            let win = loop {
-                let (cur, ch) = slots[s];
-                if cur == packed {
-                    break true;
-                }
-                if ch == h && get(cur).id.same(&r.id, files) {
-                    break false;
-                }
-                s = (s + 1) & mask;
-            };
-            if !win {
+        let recs = &tv[p][..];
+        for (i, r) in recs.iter().enumerate() {
+            let dense = off[t] + i;
+            if (win[dense >> 6] >> (dense & 63)) & 1 == 0 {
                 continue;
             }
             let etype = r.flags >> 4;
@@ -396,18 +418,36 @@ fn dedup_events(ctx: &Ctx, files: &Arenas, raws: &[Vec<Vec<EvRaw>>], p: usize) -
     out
 }
 
-fn dedup_clicks(ctx: &Ctx, files: &Arenas, raws: &[Vec<Vec<ClRaw>>], p: usize) -> Vec<Vec<ClValid>> {
+fn dedup_clicks(ctx: &Ctx, files: &Arenas, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
     let total: usize = raws.iter().map(|t| t[p].len()).sum();
     let cap = (total * 2).max(16).next_power_of_two();
     let mask = cap - 1;
-    let mut slots: Vec<(u32, u64)> = vec![(u32::MAX, 0); cap];
+    let mut slots: HugeVec<(u32, u64)> = HugeVec::with_len_uninit(cap);
+    for s in slots.iter_mut() {
+        *s = (u32::MAX, 0);
+    }
     let get = |packed: u32| -> &ClRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
-    let mut out: Vec<Vec<ClValid>> = (0..P).map(|_| Vec::with_capacity(total / P + 16)).collect();
+    let mut out: Vec<HugeVec<ClValid>> = (0..P).map(|_| HugeVec::with_capacity(total / P + 1024)).collect();
     let lo = ctx.ws - REACH;
+    const D: usize = 8;
     for (t, tv) in raws.iter().enumerate() {
-        for (i, r) in tv[p].iter().enumerate() {
+        let recs = &tv[p][..];
+        let n = recs.len();
+        let mut hs = [0u64; D];
+        for i in 0..n.min(D) {
+            let h = key_hash(&recs[i].id, files);
+            hs[i] = h;
+            prefetch(unsafe { slots.as_ptr().add((h as usize) & mask) });
+        }
+        for i in 0..n {
+            let r = &recs[i];
+            let h = hs[i % D];
+            if i + D < n {
+                let h2 = key_hash(&recs[i + D].id, files);
+                hs[i % D] = h2;
+                prefetch(unsafe { slots.as_ptr().add((h2 as usize) & mask) });
+            }
             let packed = ((t as u32) << 27) | (i as u32);
-            let h = key_hash(&r.id, files);
             let mut s = (h as usize) & mask;
             let fresh = loop {
                 let (cur, ch) = slots[s];
@@ -496,15 +536,15 @@ impl Intern {
 
 struct Partition {
     table: Intern,
-    events: Vec<EvMid>,
-    clicks: Vec<ClMid>,
+    events: HugeVec<EvMid>,
+    clicks: HugeVec<ClMid>,
 }
 
 fn intern_partition(
     files: &Arenas,
-    links: &[Vec<Vec<LinkRaw>>],
-    evv: &[Vec<Vec<EvValid>>],
-    clv: &[Vec<Vec<ClValid>>],
+    links: &[Vec<HugeVec<LinkRaw>>],
+    evv: &[Vec<HugeVec<EvValid>>],
+    clv: &[Vec<HugeVec<ClValid>>],
     q: usize,
 ) -> Partition {
     let nev: usize = evv.iter().map(|v| v[q].len()).sum();
@@ -513,29 +553,29 @@ fn intern_partition(
     let mut table = Intern::new(nl * 2 + nev / 8 + ncl / 8 + 64);
     // link endpoints that hash into this partition (links were partitioned by hash of side a; side b checked)
     for t in links {
-        for l in &t[q] {
+        for l in t[q].iter() {
             table.insert(l.ha, l.a, files);
         }
     }
     for t in links {
         for lp in t.iter() {
-            for l in lp {
+            for l in lp.iter() {
                 if part(l.hb) == q {
                     table.insert(l.hb, l.b, files);
                 }
             }
         }
     }
-    let mut events = Vec::with_capacity(nev);
+    let mut events: HugeVec<EvMid> = HugeVec::with_capacity(nev);
     for v in evv {
-        for e in &v[q] {
+        for e in v[q].iter() {
             let uid = table.insert(e.uhash, e.user, files);
             events.push(EvMid { ts: e.ts, uid, price: e.price, cat: e.cat, etype: e.etype });
         }
     }
-    let mut clicks = Vec::with_capacity(ncl);
+    let mut clicks: HugeVec<ClMid> = HugeVec::with_capacity(ncl);
     for v in clv {
-        for c in &v[q] {
+        for c in v[q].iter() {
             let uid = table.insert(c.uhash, c.user, files);
             clicks.push(ClMid { id: c.id, ts: c.ts, uid, camp: c.camp });
         }
@@ -714,9 +754,10 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
     let mut ok = 0usize;
     for &u in units {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        for l in Lines::new(buf.data(), buf.lo, buf.hi) {
+        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+        while let Some((l, m)) = sc.next() {
             let mut f = [&b""[..]; 7];
-            if split_fields(l, &mut f) {
+            if split_scanned(l, m, &mut f) {
                 ok += f[0].len();
             }
         }
@@ -727,19 +768,21 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
     let mut arena = Vec::new();
     for &u in units {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        for l in Lines::new(buf.data(), buf.lo, buf.hi) {
-            if let Some(r) = parse_event_line(ctx, 0, &mut arena, l) {
+        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+        while let Some((l, m)) = sc.next() {
+            if let Some(r) = parse_event_line(ctx, 0, &mut arena, l, m) {
                 acc = acc.wrapping_add(r.ts as u64 ^ r.price as u64);
             }
         }
     }
     eprintln!("bench +parse_event_line: {} {:.3}s", acc, t.elapsed().as_secs_f64());
     let t = Instant::now();
-    let mut out: Vec<Vec<EvRaw>> = (0..P).map(|_| Vec::with_capacity(lines / P + 16)).collect();
+    let mut out: Vec<HugeVec<EvRaw>> = (0..P).map(|_| HugeVec::with_capacity(lines / P + 16)).collect();
     for &u in units {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        for l in Lines::new(buf.data(), buf.lo, buf.hi) {
-            if let Some(r) = parse_event_line(ctx, 0, &mut arena, l) {
+        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+        while let Some((l, m)) = sc.next() {
+            if let Some(r) = parse_event_line(ctx, 0, &mut arena, l, m) {
                 let h = key_hash(&r.id, std::slice::from_ref(&arena));
                 out[part(h)].push(r);
             }
@@ -823,16 +866,16 @@ fn main() {
     }
 
     // Phase 1: parse
-    let (ev_raw, ar_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, arena, line| {
-        parse_event_line(c, aid, arena, line).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
+    let (ev_raw, ar_e) = parse_parallel(&ctx, &inputs, &inputs.events, 0, |c, aid, arena, line, masks| {
+        parse_event_line(c, aid, arena, line, masks).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
     });
     log(&t0, "events parsed");
-    let (cl_raw, ar_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, arena, line| {
-        parse_click_line(c, aid, arena, line).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
+    let (cl_raw, ar_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, arena, line, masks| {
+        parse_click_line(c, aid, arena, line, masks).map(|r| (part(key_hash(&r.id, std::slice::from_ref(arena))), r))
     });
-    let (links, ar_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, arena, line| {
+    let (links, ar_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, arena, line, masks| {
         let mut f = [&b""[..]; 2];
-        if !split_fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+        if !split_scanned(line, masks, &mut f) || f[0].is_empty() || f[1].is_empty() {
             return None;
         }
         let a = Key::new(f[0], aid, arena);
@@ -852,8 +895,8 @@ fn main() {
 
     // Phase 2: dedup + validate, per partition
     let next = AtomicUsize::new(0);
-    let mut evv: Vec<Option<Vec<Vec<EvValid>>>> = (0..P).map(|_| None).collect();
-    let mut clv: Vec<Option<Vec<Vec<ClValid>>>> = (0..P).map(|_| None).collect();
+    let mut evv: Vec<Option<Vec<HugeVec<EvValid>>>> = (0..P).map(|_| None).collect();
+    let mut clv: Vec<Option<Vec<HugeVec<ClValid>>>> = (0..P).map(|_| None).collect();
     {
         let evp = Shared(evv.as_mut_ptr());
         let clp = Shared(clv.as_mut_ptr());
@@ -881,8 +924,8 @@ fn main() {
     }
     drop(ev_raw);
     drop(cl_raw);
-    let evv: Vec<Vec<Vec<EvValid>>> = evv.into_iter().map(|x| x.unwrap()).collect();
-    let clv: Vec<Vec<Vec<ClValid>>> = clv.into_iter().map(|x| x.unwrap()).collect();
+    let evv: Vec<Vec<HugeVec<EvValid>>> = evv.into_iter().map(|x| x.unwrap()).collect();
+    let clv: Vec<Vec<HugeVec<ClValid>>> = clv.into_iter().map(|x| x.unwrap()).collect();
     log(&t0, "dedup+validate done");
 
     // Phase 3: intern users per partition
@@ -919,7 +962,7 @@ fn main() {
     let mut parent: Vec<u32> = (0..n_ids as u32).collect();
     for t in &links {
         for lp in t {
-            for l in lp {
+            for l in lp.iter() {
                 let qa = part(l.ha);
                 let qb = part(l.hb);
                 let ua = base[qa] + parts[qa].table.lookup(l.ha, &l.a, files).expect("link a");
@@ -974,7 +1017,7 @@ fn main() {
         n_ev,
         &person_of_uid,
         &base,
-        |q| &parts[q].events,
+        |q| &parts[q].events[..],
         |e| e.uid,
         |e| EvFinal { ts: e.ts, price: e.price, cat: e.cat, etype: e.etype },
     );
@@ -984,7 +1027,7 @@ fn main() {
         n_cl,
         &person_of_uid,
         &base,
-        |q| &parts[q].clicks,
+        |q| &parts[q].clicks[..],
         |c| c.uid,
         |c| ClFinal { id: c.id, ts: c.ts, camp: c.camp },
     );
@@ -1089,7 +1132,7 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
     src: impl Fn(usize) -> &'a [S] + Sync + Send + Copy,
     uid_of: impl Fn(&S) -> u32 + Sync + Send + Copy,
     conv: impl Fn(&S) -> T + Sync + Send + Copy,
-) -> (Vec<T>, Vec<u32>) {
+) -> (HugeVec<T>, Vec<u32>) {
     // histograms per partition
     let mut hist: Vec<Vec<u32>> = Vec::with_capacity(P);
     {
@@ -1129,8 +1172,7 @@ fn scatter_by_person<'a, S: Copy + Sync + 'a, T: Copy + Default + Send + Sync>(
         start[p + 1] = start[p] + tot;
     }
     debug_assert_eq!(start[n_persons] as usize, n);
-    let mut out: Vec<T> = Vec::with_capacity(n);
-    unsafe { out.set_len(n) };
+    let mut out: HugeVec<T> = HugeVec::with_len_uninit(n);
     {
         let next = AtomicUsize::new(0);
         let op = Shared(out.as_mut_ptr());

@@ -51,3 +51,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   10M on Mac, 8 threads: parse 0.57 | clicks+links 0.10 | dedup 0.50 | intern 0.14 | group 0.14 | walk 0.06 | out 0.09 => 1.68 s.
   Dedup is latency-bound (random probes into 32 MB slot tables): add prefetch + winner bitmap. Parse: fuse newline into SIMD pass,
   huge-page backed partition vectors (first-touch faults), SWAR F1.
+- 2026-11-20 22:45: fused newline SIMD scanner, HugeVec (mmap+MADV_HUGEPAGE) buffers, dedup prefetch + winner bitmap.
+  10M Mac: parse 0.38-0.6 | dedup 0.35 | intern 0.13 | group 0.12 | walk 0.05 | out 0.11 => 1.3-1.5 s. RSS 1.05 GB.
+  Parse scales only ~2.4x on 8 Mac threads (page-fault serialization suspected). Need Linux measurements (Docker VM arm64).

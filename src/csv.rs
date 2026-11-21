@@ -53,70 +53,90 @@ pub fn split_fields_scalar<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u
 
 /// Comma and quote bitmasks over the first 128 bytes at `p` (over-read allowed: caller guarantees padding).
 #[inline(always)]
-#[allow(unused_unsafe)]
 unsafe fn masks128(p: *const u8) -> (u128, u128) {
+    let (c, q, _) = masks3(p);
+    (c, q)
+}
+
+/// Comma, quote and newline bitmasks over the first 128 bytes at `p`.
+#[inline(always)]
+#[allow(unused_unsafe)]
+pub unsafe fn masks3(p: *const u8) -> (u128, u128, u128) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use std::arch::x86_64::*;
         let comma = _mm256_set1_epi8(b',' as i8);
         let quote = _mm256_set1_epi8(b'"' as i8);
+        let nl = _mm256_set1_epi8(b'\n' as i8);
         let mut cm: u128 = 0;
         let mut qm: u128 = 0;
+        let mut nm: u128 = 0;
         let mut i = 0;
         while i < 4 {
             let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
             let c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32 as u128;
             let q = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, quote)) as u32 as u128;
+            let n = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl)) as u32 as u128;
             cm |= c << (32 * i);
             qm |= q << (32 * i);
+            nm |= n << (32 * i);
             i += 1;
         }
-        return (cm, qm);
+        return (cm, qm, nm);
     }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     {
         use std::arch::x86_64::*;
         let comma = _mm_set1_epi8(b',' as i8);
         let quote = _mm_set1_epi8(b'"' as i8);
+        let nl = _mm_set1_epi8(b'\n' as i8);
         let mut cm: u128 = 0;
         let mut qm: u128 = 0;
+        let mut nm: u128 = 0;
         let mut i = 0;
         while i < 8 {
             let v = _mm_loadu_si128(p.add(16 * i) as *const __m128i);
             let c = _mm_movemask_epi8(_mm_cmpeq_epi8(v, comma)) as u32 as u128;
             let q = _mm_movemask_epi8(_mm_cmpeq_epi8(v, quote)) as u32 as u128;
+            let n = _mm_movemask_epi8(_mm_cmpeq_epi8(v, nl)) as u32 as u128;
             cm |= c << (16 * i);
             qm |= q << (16 * i);
+            nm |= n << (16 * i);
             i += 1;
         }
-        return (cm, qm);
+        return (cm, qm, nm);
     }
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::aarch64::*;
         let comma = vdupq_n_u8(b',');
         let quote = vdupq_n_u8(b'"');
+        let nl = vdupq_n_u8(b'\n');
         let mut cm: u128 = 0;
         let mut qm: u128 = 0;
+        let mut nm: u128 = 0;
         let mut i = 0;
         while i < 8 {
             let v = vld1q_u8(p.add(16 * i));
             cm |= (movemask16(vceqq_u8(v, comma)) as u128) << (16 * i);
             qm |= (movemask16(vceqq_u8(v, quote)) as u128) << (16 * i);
+            nm |= (movemask16(vceqq_u8(v, nl)) as u128) << (16 * i);
             i += 1;
         }
-        return (cm, qm);
+        return (cm, qm, nm);
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let s = std::slice::from_raw_parts(p, 128);
         let mut cm: u128 = 0;
         let mut qm: u128 = 0;
+        let mut nm: u128 = 0;
         for (i, &b) in s.iter().enumerate() {
             cm |= ((b == b',') as u128) << i;
             qm |= ((b == b'"') as u128) << i;
+            nm |= ((b == b'\n') as u128) << i;
         }
-        (cm, qm)
+        (cm, qm, nm)
     }
 }
 
@@ -144,9 +164,14 @@ pub fn split_fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N])
         return split_fields_scalar(line, out);
     }
     let (cm, qm) = unsafe { masks128(line.as_ptr()) };
-    let valid: u128 = if n == 128 { u128::MAX } else { (1u128 << n) - 1 };
-    let cm = cm & valid;
-    let qm = qm & valid;
+    let valid: u128 = (1u128 << n) - 1;
+    split_masked(line, cm & valid, qm & valid, out)
+}
+
+/// Split with precomputed comma/quote masks already restricted to the line (line.len() < 128).
+#[inline(always)]
+pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out: &mut [&'a [u8]; N]) -> bool {
+    let n = line.len();
     if cm.count_ones() as usize != N - 1 {
         return false;
     }
@@ -185,6 +210,59 @@ pub fn split_fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N])
         s = e + 1;
     }
     true
+}
+
+/// Line scanner that finds the newline with the same SIMD pass that produces the comma/quote masks.
+/// Requires 128 bytes of readable padding after `end` in `buf`.
+pub struct Scanner<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    end: usize,
+}
+
+impl<'a> Scanner<'a> {
+    pub fn new(buf: &'a [u8], start: usize, end: usize) -> Self {
+        Scanner { buf, pos: start, end }
+    }
+    /// Next line and, when it is shorter than 128 bytes, its comma/quote masks.
+    #[inline(always)]
+    pub fn next(&mut self) -> Option<(&'a [u8], Option<(u128, u128)>)> {
+        if self.pos >= self.end {
+            return None;
+        }
+        let (cm, qm, nm) = unsafe { masks3(self.buf.as_ptr().add(self.pos)) };
+        if nm != 0 {
+            let len = nm.trailing_zeros() as usize;
+            let line = &self.buf[self.pos..self.pos + len];
+            let valid: u128 = (1u128 << len) - 1;
+            self.pos += len + 1;
+            return Some((line, Some((cm & valid, qm & valid))));
+        }
+        // long line (>= 128 bytes): find the newline the slow way
+        let start = self.pos;
+        let from = (start + 128).min(self.end);
+        let len = match memchr::memchr(b'\n', &self.buf[from..self.end]) {
+            Some(k) => from + k - start,
+            None => self.end - start,
+        };
+        let line = &self.buf[start..start + len];
+        self.pos = start + len + 1;
+        Some((line, None))
+    }
+}
+
+/// Split a line produced by `Scanner`.
+#[inline(always)]
+pub fn split_scanned<'a, const N: usize>(line: &'a [u8], masks: Option<(u128, u128)>, out: &mut [&'a [u8]; N]) -> bool {
+    match masks {
+        Some((cm, qm)) => {
+            if line.is_empty() {
+                return false;
+            }
+            split_masked(line, cm, qm, out)
+        }
+        None => split_fields_scalar(line, out),
+    }
 }
 
 /// Iterate lines of `buf[start..end]`; each line ends at '\n' or at `end`.
@@ -269,6 +347,37 @@ mod tests {
         let (ra, a, rb, b) = both::<3>(&l);
         assert!(ra && rb);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn scanner_matches_lines() {
+        let mut data = b"h1,h2\na,b\n\n\"x\",\"\"\nlast,line".to_vec();
+        let mut long = vec![b'z'; 300];
+        long[10] = b',';
+        data.push(b'\n');
+        data.extend_from_slice(&long);
+        data.push(b'\n');
+        data.extend_from_slice(b"q,r\n");
+        let n = data.len();
+        data.resize(n + 256, 0);
+        let mut sc = Scanner::new(&data, 0, n);
+        let mut got = Vec::new();
+        while let Some((line, masks)) = sc.next() {
+            let mut f = [&b""[..]; 2];
+            let ok = split_scanned(line, masks, &mut f);
+            got.push((line.to_vec(), ok, f.iter().map(|x| x.to_vec()).collect::<Vec<_>>()));
+        }
+        let exp: Vec<Vec<u8>> = Lines::new(&data, 0, n).map(|l| l.to_vec()).collect();
+        assert_eq!(got.len(), exp.len());
+        for (g, e) in got.iter().zip(exp.iter()) {
+            assert_eq!(&g.0, e);
+            let mut f = [&b""[..]; 2];
+            let ok = split_fields_scalar(e, &mut f);
+            assert_eq!(g.1, ok);
+            if ok {
+                assert_eq!(g.2, f.iter().map(|x| x.to_vec()).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]
