@@ -776,3 +776,254 @@ impl Lookup {
         }
     }
 }
+
+// ---------- global record pool with chunked per-partition scatter ----------
+
+/// Records per pool chunk. A chunk is the unit a producer takes from the pool for one partition, so a
+/// partition's records are runs of up to CHUNK contiguous records; the unused tail of a run is wasted.
+pub const CHUNK: usize = 512;
+/// Chunks a producer takes from the pool at once (one atomic add, one populate call).
+const RUN: usize = 32;
+
+fn map_lazy(bytes: usize) -> *mut u8 {
+    unsafe {
+        let ask = bytes + HUGE;
+        let raw = libc::mmap(
+            std::ptr::null_mut(),
+            ask,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        assert!(raw != libc::MAP_FAILED, "mmap failed for {} bytes", bytes);
+        let addr = raw as usize;
+        let aligned = (addr + HUGE - 1) & !(HUGE - 1);
+        if aligned > addr {
+            libc::munmap(raw, aligned - addr);
+        }
+        let tail = addr + ask - (aligned + bytes);
+        if tail > 0 {
+            libc::munmap((aligned + bytes) as *mut libc::c_void, tail);
+        }
+        #[cfg(target_os = "linux")]
+        libc::madvise(aligned as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        aligned as *mut u8
+    }
+}
+
+/// One reservation of records of T, handed out in runs of chunks by an atomic bump. A record's global
+/// index (u32) is stable for the pool's life, so a later phase can address one record directly.
+/// The reservation is virtual (2x the estimate); pages are populated run by run as they are taken.
+pub struct Pool<T: Copy> {
+    base: *mut T,
+    cap: usize, // records
+    next: std::sync::atomic::AtomicUsize,
+    bytes: usize,
+}
+unsafe impl<T: Copy + Send> Send for Pool<T> {}
+unsafe impl<T: Copy + Sync> Sync for Pool<T> {}
+
+impl<T: Copy> Pool<T> {
+    pub fn new(est: usize) -> Self {
+        let size = std::mem::size_of::<T>();
+        let chunks = (est * 2 + (1 << 20)) / CHUNK + RUN;
+        let cap = chunks * CHUNK;
+        assert!(cap < u32::MAX as usize, "pool too large for u32 indices");
+        let bytes = (cap * size + HUGE - 1) / HUGE * HUGE;
+        Pool { base: map_lazy(bytes) as *mut T, cap, next: std::sync::atomic::AtomicUsize::new(0), bytes }
+    }
+    #[inline(always)]
+    pub fn at(&self, i: u32) -> *mut T {
+        unsafe { self.base.add(i as usize) }
+    }
+    /// Takes RUN chunks; returns the first record index.
+    fn grab(&self) -> u32 {
+        let c = self.next.fetch_add(RUN, std::sync::atomic::Ordering::Relaxed);
+        assert!((c + RUN) * CHUNK <= self.cap, "record pool exhausted: estimate too low");
+        let first = c * CHUNK;
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // MADV_POPULATE_WRITE: fault the run in with one call (ignored on kernels before 5.14)
+            let p = self.base.add(first) as *mut libc::c_void;
+            libc::madvise(p, RUN * CHUNK * std::mem::size_of::<T>(), 23);
+        }
+        first as u32
+    }
+    pub fn used_records(&self) -> usize {
+        self.next.load(std::sync::atomic::Ordering::Relaxed) * CHUNK
+    }
+}
+impl<T: Copy> Drop for Pool<T> {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.bytes) };
+    }
+}
+
+/// Runs of records of one partition: (first record index, length), in production order.
+pub type Runs = Vec<(u32, u32)>;
+
+/// One producer's partitioned output into a shared Pool: records are staged four per partition in
+/// 64-byte lines and streamed to the partition's current chunk with non-temporal stores. `push` returns
+/// the record's global index.
+pub struct ChunkScatter<'a, T: Copy> {
+    pool: &'a Pool<T>,
+    cur: Vec<u32>,
+    end: Vec<u32>,
+    lists: Vec<Runs>,
+    stage: Vec<Line>,
+    cnt: Vec<u8>,
+    per: usize,
+    lines: usize,
+    run: (u32, u32),
+}
+
+impl<'a, T: Copy> ChunkScatter<'a, T> {
+    pub fn new(pool: &'a Pool<T>, np: usize) -> Self {
+        let size = std::mem::size_of::<T>();
+        assert!(size > 0 && 64 % size == 0 && size <= 64, "record size must divide 64");
+        let per = 4.max(64 / size);
+        let lines = (per * size + 63) / 64;
+        assert!(CHUNK % per == 0);
+        ChunkScatter {
+            pool,
+            cur: vec![0; np],
+            end: vec![0; np],
+            lists: (0..np).map(|_| Vec::new()).collect(),
+            stage: vec![Line([0u8; 64]); np * lines],
+            cnt: vec![0; np],
+            per,
+            lines,
+            run: (0, 0),
+        }
+    }
+    #[inline(always)]
+    fn stage_ptr(&mut self, p: usize) -> *mut u8 {
+        unsafe { self.stage.as_mut_ptr().add(p * self.lines) as *mut u8 }
+    }
+    #[cold]
+    fn new_chunk(&mut self, p: usize) {
+        if self.run.0 == self.run.1 {
+            let first = self.pool.grab();
+            self.run = (first, first + (RUN * CHUNK) as u32);
+        }
+        self.cur[p] = self.run.0;
+        self.end[p] = self.run.0 + CHUNK as u32;
+        self.run.0 += CHUNK as u32;
+        self.lists[p].push((self.cur[p], 0));
+    }
+    #[inline(always)]
+    pub fn push(&mut self, p: usize, v: T) -> u32 {
+        let c = self.cnt[p] as usize;
+        if c == 0 && self.cur[p] == self.end[p] {
+            self.new_chunk(p);
+        }
+        unsafe {
+            let dst = self.stage_ptr(p).add(c * std::mem::size_of::<T>()) as *mut T;
+            dst.write(v);
+        }
+        let idx = self.cur[p] + c as u32;
+        if c + 1 == self.per {
+            self.flush(p);
+            self.cnt[p] = 0;
+        } else {
+            self.cnt[p] = (c + 1) as u8;
+        }
+        idx
+    }
+    #[inline(always)]
+    fn flush(&mut self, p: usize) {
+        unsafe {
+            let dst = self.pool.at(self.cur[p]) as *mut u8;
+            let src = self.stage_ptr(p) as *const u8;
+            for i in 0..self.lines {
+                stream64(dst.add(i * 64), src.add(i * 64));
+            }
+        }
+        self.cur[p] += self.per as u32;
+        self.lists[p].last_mut().unwrap().1 += self.per as u32;
+    }
+    pub fn finish(mut self) -> Vec<Runs> {
+        for p in 0..self.cnt.len() {
+            let c = self.cnt[p] as usize;
+            if c > 0 {
+                unsafe {
+                    let src = self.stage_ptr(p) as *const T;
+                    std::ptr::copy_nonoverlapping(src, self.pool.at(self.cur[p]), c);
+                }
+                self.lists[p].last_mut().unwrap().1 += c as u32;
+                self.cur[p] += c as u32;
+                self.cnt[p] = 0;
+            }
+        }
+        sfence();
+        self.lists
+    }
+}
+
+/// Read side of a pool: the runs of each producer for partition p, as slices.
+pub struct PoolParts<'a, T: Copy> {
+    pub pool: &'a Pool<T>,
+    pub lists: Vec<Vec<Runs>>, // [producer][partition]
+}
+impl<'a, T: Copy> PoolParts<'a, T> {
+    #[inline(always)]
+    pub fn slices(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let pool = self.pool;
+        self.lists.iter().flat_map(move |l| l[p].iter().map(move |&(s, n)| unsafe { std::slice::from_raw_parts(pool.at(s) as *const T, n as usize) }))
+    }
+    /// Slices with their first record's global index.
+    #[inline(always)]
+    pub fn runs(&self, p: usize) -> impl Iterator<Item = (u32, &[T])> + '_ {
+        let pool = self.pool;
+        self.lists.iter().flat_map(move |l| l[p].iter().map(move |&(s, n)| (s, unsafe { std::slice::from_raw_parts(pool.at(s) as *const T, n as usize) })))
+    }
+    pub fn len(&self, p: usize) -> usize {
+        self.lists.iter().map(|l| l[p].iter().map(|r| r.1 as usize).sum::<usize>()).sum()
+    }
+    pub fn total(&self) -> usize {
+        self.lists.iter().map(|l| l.iter().map(|runs| runs.iter().map(|r| r.1 as usize).sum::<usize>()).sum::<usize>()).sum()
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Default, PartialEq, Debug)]
+    #[repr(C)]
+    struct R {
+        a: u64,
+        b: u32,
+        c: u32,
+    }
+
+    #[test]
+    fn chunk_scatter_keeps_order_and_indices() {
+        let pool: Pool<R> = Pool::new(100_000);
+        let np = 8;
+        let mut idx: Vec<Vec<(u32, R)>> = vec![Vec::new(); np];
+        let lists: Vec<Runs> = {
+            let mut sc = ChunkScatter::new(&pool, np);
+            let mut x = 12345u64;
+            for i in 0..70_000u64 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let p = ((x >> 40) as usize) % np;
+                let r = R { a: i, b: (x >> 8) as u32, c: p as u32 };
+                let at = sc.push(p, r);
+                idx[p].push((at, r));
+            }
+            sc.finish()
+        };
+        let parts = PoolParts { pool: &pool, lists: vec![lists] };
+        for p in 0..np {
+            let got: Vec<R> = parts.slices(p).flat_map(|s| s.iter().copied()).collect();
+            let want: Vec<R> = idx[p].iter().map(|&(_, r)| r).collect();
+            assert_eq!(got, want, "partition {p} order");
+            for &(at, r) in &idx[p] {
+                assert_eq!(unsafe { *pool.at(at) }, r);
+            }
+            assert_eq!(parts.len(p), want.len());
+        }
+    }
+}
