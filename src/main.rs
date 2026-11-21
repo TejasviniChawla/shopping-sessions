@@ -947,6 +947,9 @@ fn main() {
 }
 
 fn run() {
+    if std::env::var_os("EXIT_NOW").is_some() {
+        return; // measures container start/stop overhead alone
+    }
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));

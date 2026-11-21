@@ -130,5 +130,12 @@ jobs:
               env $e DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out2 NCPU=4 NO_FORK=1 perf stat -e task-clock,page-faults /tmp/shopsess 2>&1 | grep -E "wrote|page-faults|seconds (user|sys|time)"
             done
           done
+      - name: Container overhead of our image (EXIT_NOW, scorer flags, warm)
+        run: |
+          for i in 1 2 3 4; do
+            /usr/bin/time -f "overhead wall %e s" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m \
+              --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 4 --memory 12g --memory-swap 12g \
+              --user 1000:1000 -v /tmp/data:/data:ro -v /tmp/out:/output -v /tmp/scratch:/scratch -e EXIT_NOW=1 shopsess:ci
+          done
       - name: Empty-container baseline
         run: /usr/bin/time -f "docker run overhead %e s" docker run --rm --network none alpine true
