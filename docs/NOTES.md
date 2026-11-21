@@ -181,3 +181,7 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   insertion sorts <=32, link-map prefetch) NEUTRAL (0.88/0.94 vs 0.89/0.93); link task 0.115 s unchanged by prefetch.
   Two-round person stage (route by user, resolve each distinct user once, re-scatter 61% linked events by name): fixtures
   36/36, dev MATCH; CI A/B dispatched. Mac timings unusable while seedcheck's Python reference runs.
+- 2026-11-21 ~07:40 ET: two-round person stage (HEAD of v3) vs main 6d5c18e on Zen4 9V74: WIN in-process 0.698/0.705 vs
+  0.718/0.720, wall 0.88/0.90 vs 0.90/0.92. dedup emit 0.31 -> 0.11 thread-s; round A+B grouping 0.16 (was 0.09), sorts 0.22,
+  walk 0.24. 61% of events belong to linked persons and are re-scattered. Env sweeps dispatched: UNIT_KB 128/2048, LOG_P 7/8,
+  PIN=0. Parse is now ~49% of in-process time (1.08 thread-s / 10M = 108 ns/line on Zen4), the dominant remaining cost.
