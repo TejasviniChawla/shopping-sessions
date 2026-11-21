@@ -15,6 +15,9 @@ on:
       envs:
         description: semicolon-separated env settings, each run natively under perf stat
         default: ""
+      variants:
+        description: "1 = also time native TIMING runs on data variants (no quotes; all event types view)"
+        default: ""
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -129,6 +132,19 @@ jobs:
             echo "=== $img, output on bind mount ==="
             /usr/bin/time -f "wall %e s" docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m --cpus 4 --memory 12g --user 1000:1000 \
               -v /tmp/data:/data:ro -v /tmp/out:/output -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=4 shopsess:$img 2>&1 | grep -E "wrote|wall"
+          done
+      - name: Data variants (native, TIMING)
+        if: ${{ github.event.inputs.variants == '1' }}
+        run: |
+          set -e
+          mk() { rm -rf /tmp/$1; mkdir -p /tmp/$1/events; cp -r /tmp/data/clicks /tmp/data/links /tmp/data/manifest.json /tmp/data/products.csv /tmp/data/campaigns.csv /tmp/$1/; }
+          mk var_orig; cp /tmp/data/events/*.csv /tmp/var_orig/events/
+          mk var_noq; for f in /tmp/data/events/*.csv; do sed 's/"//g' "$f" > /tmp/var_noq/events/$(basename "$f"); done
+          mk var_allview; for f in /tmp/var_noq/events/*.csv; do sed -E 's/,(purchase|cart),/,view,/' "$f" > /tmp/var_allview/events/$(basename "$f"); done
+          for v in var_orig var_noq var_allview var_orig var_noq var_allview; do
+            rm -rf /tmp/outv; mkdir -p /tmp/outv
+            echo "=== $v ==="
+            TIMING=1 DATA_DIR=/tmp/$v OUTPUT_DIR=/tmp/outv NCPU=4 NO_FORK=1 /tmp/shopsess 2>&1 | grep -E "thread-seconds|events parsed"
           done
       - name: Env experiments (native, perf stat)
         if: ${{ github.event.inputs.envs != '' }}
