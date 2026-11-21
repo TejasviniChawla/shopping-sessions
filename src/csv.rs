@@ -207,16 +207,26 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
         return false;
     }
     if qm == 0 {
-        // fast path: no quotes
+        // fast path: no quotes; comma positions from the two 64-bit halves
         let mut s = 0usize;
-        let mut c = cm;
-        for k in 0..N - 1 {
-            let e = c.trailing_zeros() as usize;
-            c &= c - 1;
-            out[k] = &line[s..e];
+        let mut k = 0;
+        let mut w = cm as u64;
+        while w != 0 {
+            let e = w.trailing_zeros() as usize;
+            w &= w - 1;
+            out[k] = unsafe { line.get_unchecked(s..e) };
             s = e + 1;
+            k += 1;
         }
-        out[N - 1] = &line[s..n];
+        let mut w = (cm >> 64) as u64;
+        while w != 0 {
+            let e = 64 + w.trailing_zeros() as usize;
+            w &= w - 1;
+            out[k] = unsafe { line.get_unchecked(s..e) };
+            s = e + 1;
+            k += 1;
+        }
+        out[N - 1] = unsafe { line.get_unchecked(s..n) };
         return true;
     }
     // quotes: a quote is valid only as the first and last byte of a field of length >= 2.
@@ -229,7 +239,7 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
     if (open | close) != qm || (open & close) != 0 {
         return false;
     }
-    let mut c = cm | (1u128 << n);
+    let c = cm | (1u128 << n);
     let starts_ne = starts & !c;
     let ends_ne = ends & !cm;
     let ob = pext128(open, starts_ne);
@@ -237,11 +247,26 @@ pub fn split_masked<'a, const N: usize>(line: &'a [u8], cm: u128, qm: u128, out:
     if ob != cb {
         return false;
     }
+    // field end positions from the two 64-bit halves (no 128-bit shifts in the loop)
+    let mut ends_pos = [0usize; N];
+    let mut k = 0;
+    let mut w = cm as u64;
+    while w != 0 {
+        ends_pos[k] = w.trailing_zeros() as usize;
+        w &= w - 1;
+        k += 1;
+    }
+    let mut w = (cm >> 64) as u64;
+    while w != 0 {
+        ends_pos[k] = 64 + w.trailing_zeros() as usize;
+        w &= w - 1;
+        k += 1;
+    }
+    ends_pos[N - 1] = n;
     let mut s = 0usize;
     let mut ob = ob as u32;
     for k in 0..N {
-        let e = c.trailing_zeros() as usize;
-        c &= c - 1;
+        let e = ends_pos[k];
         let ne = (e > s) as u32;
         let o = (ob & ne) as usize;
         ob >>= ne;

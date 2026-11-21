@@ -799,7 +799,15 @@ struct Walker<'a> {
     mark: Vec<u32>,
     serial: u32,
     rows: Vec<URow>,
-    camp: Vec<[i64; 4]>, // [sessions, purchasing, revenue, assisted] indexed camp*ndays+day
+    camp: Vec<CampCell>, // indexed camp*ndays+day
+}
+
+#[derive(Clone, Copy, Default)]
+struct CampCell {
+    sessions: u32,
+    purchasing: u32,
+    assisted: u32,
+    revenue: u64,
 }
 
 impl<'a> Walker<'a> {
@@ -814,7 +822,7 @@ impl<'a> Walker<'a> {
             mark: vec![u32::MAX; ctx.ncamp as usize + 1],
             serial: 0,
             rows: Vec::new(),
-            camp: vec![[0; 4]; (ctx.ncamp as usize + 1) * ndays],
+            camp: vec![CampCell::default(); (ctx.ncamp as usize + 1) * ndays],
         }
     }
 
@@ -904,16 +912,16 @@ impl<'a> Walker<'a> {
                 self.ctx.ncamp as usize
             };
             let cell = &mut self.camp[camp * ndays + di];
-            cell[0] += 1;
-            cell[1] += purch as i64;
-            cell[2] += rev;
+            cell.sessions += 1;
+            cell.purchasing += purch as u32;
+            cell.revenue += rev as u64;
             self.serial += 1;
             let serial = self.serial;
             for c in &cl[lo..hi] {
                 let ci = c.camp as usize;
                 if self.mark[ci] != serial {
                     self.mark[ci] = serial;
-                    self.camp[ci * ndays + di][3] += 1;
+                    self.camp[ci * ndays + di].assisted += 1;
                 }
             }
             i = j;
@@ -1401,7 +1409,7 @@ fn run() {
     const BLOCK: usize = 512;
     let user_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&user_dir).expect("mkdir user_daily");
-    let results: Vec<(Vec<[i64; 4]>, usize)> = std::thread::scope(|s| {
+    let results: Vec<(Vec<CampCell>, usize)> = std::thread::scope(|s| {
         let mut hs = Vec::new();
         let evp = Shared(ev_final.as_ptr() as *mut EvFinal);
         let clp = Shared(cl_final.as_ptr() as *mut ClFinal);
@@ -1485,9 +1493,10 @@ fn run() {
     let mut camp = vec![[0i64; 4]; ncells];
     for (wc, _) in &results {
         for (i, c) in wc.iter().enumerate() {
-            for k in 0..4 {
-                camp[i][k] += c[k];
-            }
+            camp[i][0] += c.sessions as i64;
+            camp[i][1] += c.purchasing as i64;
+            camp[i][2] += c.revenue as i64;
+            camp[i][3] += c.assisted as i64;
         }
     }
     let mut cc = out::CampaignDailyCols::new(ncells);
