@@ -656,3 +656,63 @@ pub fn prefetch<T>(p: *const T) {
         let _ = p;
     }
 }
+
+/// Lookup of small reference tables (products, campaigns): IDs of the shape `<prefix><decimal>` with no
+/// leading zeros index an array directly; everything else goes through the hash table.
+pub struct Lookup {
+    prefix: Vec<u8>,
+    arr: Vec<u32>,
+    table: SmallTable,
+}
+
+impl Lookup {
+    pub fn new(prefix: &[u8], cap: usize) -> Self {
+        Lookup { prefix: prefix.to_vec(), arr: Vec::new(), table: SmallTable::with_capacity(cap) }
+    }
+    /// Canonical decimal number after the prefix (no leading zeros, at most 7 digits), or None.
+    #[inline(always)]
+    fn number(&self, id: &[u8]) -> Option<usize> {
+        let pl = self.prefix.len();
+        if id.len() <= pl || id.len() > pl + 7 || &id[..pl] != &self.prefix[..] {
+            return None;
+        }
+        let d = &id[pl..];
+        if d[0] == b'0' {
+            return None;
+        }
+        let mut v = 0usize;
+        for &c in d {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as usize;
+        }
+        Some(v)
+    }
+    pub fn insert(&mut self, id: &[u8], val: u32) {
+        match self.number(id) {
+            Some(n) if n < (1 << 23) => {
+                if n >= self.arr.len() {
+                    self.arr.resize(n + 1, u32::MAX);
+                }
+                self.arr[n] = val;
+            }
+            _ => self.table.insert(id, val),
+        }
+    }
+    #[inline(always)]
+    pub fn get(&self, id: &[u8]) -> Option<u32> {
+        match self.number(id) {
+            Some(n) => {
+                if n < self.arr.len() {
+                    let v = self.arr[n];
+                    if v != u32::MAX {
+                        return Some(v);
+                    }
+                }
+                self.table.get(id)
+            }
+            None => self.table.get(id),
+        }
+    }
+}

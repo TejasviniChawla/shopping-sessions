@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ingest, parse_ts_cached, DAY};
-use util::{pin_thread, prefetch, PKey, Parts, Scatter, Side, SmallTable};
+use util::{pin_thread, prefetch, Lookup, PKey, Parts, Scatter, Side, SmallTable};
 
 const SESSION_GAP: i64 = 30 * ts::MINUTE;
 const LATE: i64 = DAY;
@@ -100,8 +100,8 @@ struct LinkRaw {
 struct Ctx {
     ws: i64,
     we: i64,
-    products: SmallTable,
-    campaigns: SmallTable,
+    products: Lookup,
+    campaigns: Lookup,
     ncat: u16, // id of "unknown"
     cat_names: Vec<Vec<u8>>,
     cat_rank: Vec<u32>,
@@ -1011,7 +1011,7 @@ fn run() {
 
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut cat_ids = SmallTable::with_capacity(64);
-    let mut products = SmallTable::with_capacity(prods.len());
+    let mut products = Lookup::new(b"p", prods.len());
     for (pid, cat) in &prods {
         let cid = match cat_ids.get(cat) {
             Some(c) => c,
@@ -1033,7 +1033,7 @@ fn run() {
     for (r, &c) in order.iter().enumerate() {
         cat_rank[c] = r as u32;
     }
-    let mut campaigns = SmallTable::with_capacity(camps.len());
+    let mut campaigns = Lookup::new(b"c_", camps.len());
     let mut camp_names = Vec::new();
     let mut channels = Vec::new();
     for (cid, ch) in &camps {
