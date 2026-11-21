@@ -126,3 +126,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~08:30 ET: 4a83518 (u64-halves split, compact camp cells) A/B +4% vs 8ff776b; 10 seeds OK -> recommended.
   Idle report: walk phase 22% idle (whales at the tail) -> heavy-persons-first scheduling (idle 5-10%).
   PGO added to the Dockerfile (instrumented run on a generated 1M set; automatic fallback to a plain build).
+- 2026-11-22 ~09:30 ET: PGO Docker build works (traced pgo.sh; "PGO build ok" ~23 s extra). A/B vs plain 4a83518 pending.
+  mmap input (fault-around) neutral vs pread: not adopted. Heavy-first scheduling + mirror skip: ~1% (4325cc0 lineage).
+  CI idle: parse 1%, dedup 1%, walk 5-10% after the fix.
