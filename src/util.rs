@@ -252,6 +252,53 @@ impl<T: Copy> HugeVec<T> {
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr
     }
+    #[inline(always)]
+    pub fn extend_from_slice(&mut self, src: &[T]) {
+        while self.len + src.len() > self.cap {
+            self.grow();
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(self.len), src.len()) };
+        self.len += src.len();
+    }
+}
+
+/// Software write-combining scatter into P partition vectors: records are staged in small L1-resident
+/// buffers and copied out in 512-byte bursts, so the memory system sees few sequential streams.
+pub struct Scatter<T: Copy, const P: usize> {
+    pub out: Vec<HugeVec<T>>,
+    stage: Vec<[T; 16]>,
+    cnt: [u8; P],
+}
+
+impl<T: Copy + Default, const P: usize> Scatter<T, P> {
+    pub fn new(est: usize) -> Self {
+        Scatter {
+            out: (0..P).map(|_| HugeVec::with_capacity(est)).collect(),
+            stage: vec![[T::default(); 16]; P],
+            cnt: [0; P],
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, p: usize, v: T) {
+        let c = self.cnt[p] as usize;
+        self.stage[p][c] = v;
+        if c + 1 == 16 {
+            self.out[p].extend_from_slice(&self.stage[p]);
+            self.cnt[p] = 0;
+        } else {
+            self.cnt[p] = (c + 1) as u8;
+        }
+    }
+    pub fn finish(mut self) -> Vec<HugeVec<T>> {
+        for p in 0..P {
+            let c = self.cnt[p] as usize;
+            if c > 0 {
+                let st = self.stage[p];
+                self.out[p].extend_from_slice(&st[..c]);
+            }
+        }
+        self.out
+    }
 }
 
 impl<T> std::ops::Deref for HugeVec<T> {

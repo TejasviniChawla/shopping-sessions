@@ -76,3 +76,5 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-21 04:30: CI (EPYC 7763, 4 vCPU, P=16 branchless): 1.34 s in-container (parse 0.60, dedup 0.18, intern 0.11, group 0.11,
   walk+out 0.18); docker overhead there ~0.17 s. P=64 run OOM-killed in dedup: P*P=4096 tiny HugeVecs each rounded to a 2 MB
   THP page = 8 GB+. Fix: huge pages only for >= 8 MB allocations; P=32.
+- 2026-11-21 05:00: CI Ice Lake single-thread: lines 0.21 | +split 0.26 | +parse 0.41 | +push 0.41 s per 10.8M lines.
+  Added Scatter (16-record L1 staging, 512 B bursts) for parse and dedup outputs. Mac 10M best 0.81 s.

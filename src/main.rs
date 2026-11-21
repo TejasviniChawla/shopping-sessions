@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ts, DAY};
-use util::{prefetch, HugeVec, PKey, Side, Sides, SmallTable};
+use util::{prefetch, HugeVec, PKey, Scatter, Side, Sides, SmallTable};
 
 const LOG_P: u32 = 5;
 const P: usize = 1 << LOG_P;
@@ -27,7 +27,7 @@ fn part(h: u64) -> usize {
 
 // ---------- records ----------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct EvRaw {
     id: PKey,
     user: PKey,
@@ -38,7 +38,7 @@ struct EvRaw {
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 product nonempty, bit3 price ok, bits4-5 etype
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct EvValid {
     user: PKey,
     ts: u32,
@@ -47,7 +47,7 @@ struct EvValid {
     etype: u8,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct EvMid {
     ts: u32,
     uid: u32,
@@ -64,7 +64,7 @@ struct EvFinal {
     etype: u8,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ClRaw {
     id: PKey,
     user: PKey,
@@ -73,7 +73,7 @@ struct ClRaw {
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 campaign known
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ClValid {
     id: PKey,
     user: PKey,
@@ -81,7 +81,7 @@ struct ClValid {
     camp: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ClMid {
     id: PKey,
     ts: u32,
@@ -96,7 +96,7 @@ struct ClFinal {
     camp: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct LinkRaw {
     a: PKey,
     b: PKey,
@@ -268,7 +268,7 @@ fn parse_click_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: 
 }
 
 /// Generic parallel parse over work units; each thread produces P partition vectors and one Side table.
-fn parse_parallel<T: Copy + Send, F>(
+fn parse_parallel<T: Copy + Default + Send, F>(
     ctx: &Ctx,
     inputs: &io::Inputs,
     units: &[Unit],
@@ -289,7 +289,7 @@ where
             handles.push(s.spawn(move || {
                 let aid = aid_base + t;
                 let mut side = Side::new();
-                let mut out: Vec<HugeVec<T>> = (0..P).map(|_| HugeVec::with_capacity(est)).collect();
+                let mut out: Scatter<T, P> = Scatter::new(est);
                 let mut buf = Buffer::new();
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -303,11 +303,11 @@ where
                     let mut sc = Scanner::new(data, lo, hi);
                     while let Some((line, masks)) = sc.next() {
                         if let Some((p, rec)) = f(ctx, aid, &mut side, line, masks) {
-                            out[p].push(rec);
+                            out.push(p, rec);
                         }
                     }
                 }
-                (out, side)
+                (out.finish(), side)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -377,7 +377,7 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
         }
     }
     drop(slots);
-    let mut out: Vec<HugeVec<EvValid>> = (0..P).map(|_| HugeVec::with_capacity(total / P + 1024)).collect();
+    let mut out: Scatter<EvValid, P> = Scatter::new(total / P + 1024);
     for (t, tv) in raws.iter().enumerate() {
         let recs = &tv[p][..];
         for (i, r) in recs.iter().enumerate() {
@@ -393,10 +393,10 @@ fn dedup_events(sides: &Sides, raws: &[Vec<HugeVec<EvRaw>>], p: usize) -> Vec<Hu
             if !ok {
                 continue;
             }
-            out[part(r.user.hash(sides))].push(EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype });
+            out.push(part(r.user.hash(sides)), EvValid { user: r.user, ts: r.ts, price: r.price, cat: r.cat, etype });
         }
     }
-    out
+    out.finish()
 }
 
 fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<HugeVec<ClValid>> {
@@ -407,7 +407,7 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<Hu
     for s in slots.iter_mut() {
         *s = (u32::MAX, PKey(0));
     }
-    let mut out: Vec<HugeVec<ClValid>> = (0..P).map(|_| HugeVec::with_capacity(total / P + 1024)).collect();
+    let mut out: Scatter<ClValid, P> = Scatter::new(total / P + 1024);
     const D: usize = 8;
     for tv in raws.iter() {
         let recs = &tv[p][..];
@@ -434,11 +434,11 @@ fn dedup_clicks(sides: &Sides, raws: &[Vec<HugeVec<ClRaw>>], p: usize) -> Vec<Hu
                 s = (s + 1) & mask;
             };
             if fresh && (r.flags & 7) == 7 {
-                out[part(r.user.hash(sides))].push(ClValid { id: r.id, user: r.user, ts: r.ts, camp: r.camp });
+                out.push(part(r.user.hash(sides)), ClValid { id: r.id, user: r.user, ts: r.ts, camp: r.camp });
             }
         }
     }
-    out
+    out.finish()
 }
 
 // ---------- user interning ----------
@@ -749,16 +749,17 @@ fn bench(ctx: &Ctx, inputs: &io::Inputs) {
     }
     eprintln!("bench +parse_event_line: {} {:.3}s", acc, t.elapsed().as_secs_f64());
     let t = Instant::now();
-    let mut out: Vec<HugeVec<EvRaw>> = (0..P).map(|_| HugeVec::with_capacity(lines / P + 16)).collect();
+    let mut out: Scatter<EvRaw, P> = Scatter::new(lines / P + 16);
     for &u in units {
         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
         let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
         while let Some((l, m)) = sc.next() {
             if let Some(r) = parse_event_line(ctx, 0, &mut side, l, m) {
-                out[part(r.id.hash_in(&side))].push(r);
+                out.push(part(r.id.hash_in(&side)), r);
             }
         }
     }
+    let out = out.finish();
     eprintln!("bench +push: {} {:.3}s", out.iter().map(|v| v.len()).sum::<usize>(), t.elapsed().as_secs_f64());
 }
 
