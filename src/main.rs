@@ -487,11 +487,6 @@ struct Scratch {
     ckeys: Vec<u64>,
 }
 
-#[inline(always)]
-fn person_key(user: PKey, lm: &LinkMap) -> u64 {
-    lm.get(user.0, user.hash()).unwrap_or(user.0)
-}
-
 const PF: usize = 24;
 
 /// Timing accumulators (thread-nanoseconds) for the dedup and person stages, printed when TIMING is set.
@@ -515,7 +510,7 @@ fn tick(timing: bool, acc: &std::sync::atomic::AtomicU64, t: &mut Instant) {
 /// Partition p, two passes over the raw records (no copy): pass 1 probes an L2-resident table keyed by
 /// event id and keeps the copy with the smallest ingest (the loser's "win" bit is cleared); pass 2 walks
 /// the records in memory order, validates winners, resolves the person and pushes to the thread's scatter.
-fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch, out: &mut Scatter<PRec>, log_p: u32, timing: bool) {
+fn dedup_events(raws: &[Parts<EvRaw>], p: usize, sc: &mut Scratch, out: &mut Scatter<PRec>, log_p: u32, timing: bool) {
     let mut t = Instant::now();
     let total: usize = raws.iter().map(|r| r.len(p)).sum();
     if total == 0 {
@@ -574,17 +569,10 @@ fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
     tick(timing, &T_DEDUP[0], &mut t);
     let mut dense = 0usize;
     for sl in &slices {
-        let n = sl.len();
-        for i in 0..n.min(PF) {
-            lm.prefetch(sl[i].user.hash());
-        }
-        for (i, rec) in sl.iter().enumerate() {
-            if i + PF < n {
-                lm.prefetch(sl[i + PF].user.hash());
-            }
+        for rec in sl.iter() {
             if (win[dense >> 6] >> (dense & 63)) & 1 != 0 && event_ok(rec) {
-                let pk = person_key(rec.user, lm);
-                out.push(part(PKey(pk).hash(), log_p), PRec { pkey: pk, ts: rec.ts, packed: pack_ev(rec.price, rec.cat, (rec.flags >> 4) == 2) });
+                let pk = rec.user.0;
+                out.push(part(rec.user.hash(), log_p), PRec { pkey: pk, ts: rec.ts, packed: pack_ev(rec.price, rec.cat, (rec.flags >> 4) == 2) });
             }
             dense += 1;
         }
@@ -593,7 +581,7 @@ fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
 }
 
 /// Partition p of clicks: the first copy of each click id is kept (copies are identical).
-fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch, out: &mut Scatter<CRec>, log_p: u32) {
+fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, sc: &mut Scratch, out: &mut Scatter<CRec>, log_p: u32) {
     let total: usize = raws.iter().map(|r| r.len(p)).sum();
     let cap = (total * 2).max(64).next_power_of_two();
     let mask = cap - 1;
@@ -602,14 +590,7 @@ fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
     slots.resize(cap, 0);
     for r in raws {
         for sl in r.get(p) {
-            let n = sl.len();
-            for i in 0..n.min(PF) {
-                lm.prefetch(sl[i].user.hash());
-            }
-            for (i, rec) in sl.iter().enumerate() {
-                if i + PF < n {
-                    lm.prefetch(sl[i + PF].user.hash());
-                }
+            for rec in sl.iter() {
                 let key = rec.id.0;
                 let mut s = (rec.id.hash() as usize) & mask;
                 let fresh = loop {
@@ -624,8 +605,7 @@ fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch,
                     s = (s + 1) & mask;
                 };
                 if fresh && (rec.flags & 7) == 7 {
-                    let pk = person_key(rec.user, lm);
-                    out.push(part(PKey(pk).hash(), log_p), CRec { pkey: pk, id: rec.id, lex: click_lex(rec.id), ts: rec.ts, camp: rec.camp, _pad: [0; 2] });
+                    out.push(part(rec.user.hash(), log_p), CRec { pkey: rec.user.0, id: rec.id, lex: click_lex(rec.id), ts: rec.ts, camp: rec.camp, _pad: [0; 2] });
                 }
             }
         }
@@ -888,21 +868,51 @@ impl LocalIds {
     }
 }
 
-/// One person partition: local ids, counting sort of events and clicks, per-person sort + walk.
-fn person_partition(
-    q: usize,
-    evs: &[Parts<PRec>],
-    cls: &[Parts<CRec>],
-    w: &mut Walker,
-    radix_tmp: &mut Vec<u64>,
-    timing: bool,
-) {
-    let mut tm = Instant::now();
+/// Sort one person's events (u64 ts<<32|packed) and clicks, then walk them.
+#[inline(always)]
+fn sort_and_walk(w: &mut Walker, pkey: u64, ev: &mut [u64], cl: &mut [ClFinal], radix_tmp: &mut Vec<u64>, timing: bool, tm: &mut Instant) {
+    if ev.len() <= 32 {
+        insertion_sort_u64(ev);
+    } else if ev.len() >= 4096 {
+        radix_sort_u64(ev, radix_tmp);
+    } else {
+        ev.sort_unstable();
+    }
+    if cl.len() <= 24 {
+        for i in 1..cl.len() {
+            let mut j = i;
+            while j > 0 && click_order(&cl[j - 1], &cl[j]) == std::cmp::Ordering::Greater {
+                cl.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    } else {
+        cl.sort_unstable_by(click_order);
+    }
+    if timing {
+        tick(true, &T_PERSON[2], tm);
+    }
+    w.walk(pkey, ev, cl);
+    if timing {
+        tick(true, &T_PERSON[3], tm);
+    }
+}
+
+/// Grouped records of one partition: per local key, a contiguous run of events and of clicks.
+struct Grouped {
+    keys: Vec<u64>,
+    estart: Vec<u32>,
+    cstart: Vec<u32>,
+    ev_sorted: Vec<u64>,
+    cl_sorted: Vec<ClFinal>,
+}
+
+/// Local dense ids + counting sort of one partition's events and clicks by their key.
+fn group_partition(q: usize, evs: &[Parts<PRec>], cls: &[Parts<CRec>], timing: bool, tm: &mut Instant) -> Grouped {
     let nev: usize = evs.iter().map(|t| t.len(q)).sum();
     let ncl: usize = cls.iter().map(|t| t.len(q)).sum();
     let mut ids = LocalIds::new(nev / 12 + ncl / 12 + 64);
     const D: usize = 8;
-    // pass A: local ids + counts (ids stored per record to avoid re-probing)
     let mut ev_lid: Vec<u32> = Vec::with_capacity(nev);
     let mut cnt: Vec<u32> = Vec::new();
     for t in evs {
@@ -945,18 +955,16 @@ fn person_partition(
             }
         }
     }
-    tick(timing, &T_PERSON[0], &mut tm);
+    tick(timing, &T_PERSON[0], tm);
     let np = ids.keys.len();
     cnt.resize(np, 0);
     ccnt.resize(np, 0);
-    // prefix sums
     let mut estart = vec![0u32; np + 1];
     let mut cstart = vec![0u32; np + 1];
     for i in 0..np {
         estart[i + 1] = estart[i] + cnt[i];
         cstart[i + 1] = cstart[i] + ccnt[i];
     }
-    // pass B: counting sort
     let mut ev_sorted: Vec<u64> = vec![0; nev];
     let mut pos: Vec<u32> = estart[..np].to_vec();
     let mut k = 0usize;
@@ -985,43 +993,72 @@ fn person_partition(
             }
         }
     }
-    drop(ev_lid);
-    drop(cl_lid);
-    tick(timing, &T_PERSON[1], &mut tm);
-    // per person: sort + walk
-    for l in 0..np {
-        let (es, ee) = (estart[l] as usize, estart[l + 1] as usize);
+    tick(timing, &T_PERSON[1], tm);
+    Grouped { keys: ids.keys, estart, cstart, ev_sorted, cl_sorted }
+}
+
+/// Round A: one USER partition. Each distinct user is looked up in the link map once; unlinked users are
+/// persons of their own and are walked here; linked users' events and clicks are re-scattered by the
+/// person's name key for round B.
+fn user_partition(
+    q: usize,
+    evs: &[Parts<PRec>],
+    cls: &[Parts<CRec>],
+    lm: &LinkMap,
+    w: &mut Walker,
+    radix_tmp: &mut Vec<u64>,
+    pout: &mut Scatter<PRec>,
+    cout: &mut Scatter<CRec>,
+    log_p: u32,
+    timing: bool,
+) {
+    let mut tm = Instant::now();
+    let mut g = group_partition(q, evs, cls, timing, &mut tm);
+    let np = g.keys.len();
+    const B: usize = 16;
+    for l0 in (0..np).step_by(B) {
+        let l1 = (l0 + B).min(np);
+        for l in l0..l1 {
+            lm.prefetch(PKey(g.keys[l]).hash());
+        }
+        for l in l0..l1 {
+            let user = g.keys[l];
+            let (es, ee) = (g.estart[l] as usize, g.estart[l + 1] as usize);
+            let (cs, ce) = (g.cstart[l] as usize, g.cstart[l + 1] as usize);
+            match lm.get(user, PKey(user).hash()) {
+                None => {
+                    if es != ee {
+                        let (ev, cl) = (&mut g.ev_sorted[es..ee], &mut g.cl_sorted[cs..ce]);
+                        sort_and_walk(w, user, ev, cl, radix_tmp, timing, &mut tm);
+                    }
+                }
+                Some(name) => {
+                    let p = part(PKey(name).hash(), log_p);
+                    for &v in &g.ev_sorted[es..ee] {
+                        pout.push(p, PRec { pkey: name, ts: (v >> 32) as u32, packed: v as u32 });
+                    }
+                    for c in &g.cl_sorted[cs..ce] {
+                        cout.push(p, CRec { pkey: name, id: c.id, lex: c.lex, ts: c.ts, camp: c.camp, _pad: [0; 2] });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Round B: one PERSON partition of the re-scattered linked records.
+fn person_partition(q: usize, evs: &[Parts<PRec>], cls: &[Parts<CRec>], w: &mut Walker, radix_tmp: &mut Vec<u64>, timing: bool) {
+    let mut tm = Instant::now();
+    let mut g = group_partition(q, evs, cls, timing, &mut tm);
+    for l in 0..g.keys.len() {
+        let (es, ee) = (g.estart[l] as usize, g.estart[l + 1] as usize);
         if es == ee {
             continue;
         }
-        let (cs, ce) = (cstart[l] as usize, cstart[l + 1] as usize);
-        let ev = &mut ev_sorted[es..ee];
-        if ev.len() <= 32 {
-            insertion_sort_u64(ev);
-        } else if ev.len() >= 4096 {
-            radix_sort_u64(ev, radix_tmp);
-        } else {
-            ev.sort_unstable();
-        }
-        let cl = &mut cl_sorted[cs..ce];
-        if cl.len() <= 24 {
-            for i in 1..cl.len() {
-                let mut j = i;
-                while j > 0 && click_order(&cl[j - 1], &cl[j]) == std::cmp::Ordering::Greater {
-                    cl.swap(j - 1, j);
-                    j -= 1;
-                }
-            }
-        } else {
-            cl.sort_unstable_by(click_order);
-        }
-        if timing {
-            tick(true, &T_PERSON[2], &mut tm);
-        }
-        w.walk(ids.keys[l], ev, cl);
-        if timing {
-            tick(true, &T_PERSON[3], &mut tm);
-        }
+        let (cs, ce) = (g.cstart[l] as usize, g.cstart[l + 1] as usize);
+        let pkey = g.keys[l];
+        let (ev, cl) = (&mut g.ev_sorted[es..ee], &mut g.cl_sorted[cs..ce]);
+        sort_and_walk(w, pkey, ev, cl, radix_tmp, timing, &mut tm);
     }
 }
 
@@ -1204,7 +1241,7 @@ fn run() {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i < np {
-                        dedup_events(ev_raw, i, lm, &mut sc, &mut pout, log_p, timing);
+                        dedup_events(ev_raw, i, &mut sc, &mut pout, log_p, timing);
                     } else if i < np + n_cu {
                         let u = inputs.clicks[i - np];
                         buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
@@ -1245,7 +1282,7 @@ fn run() {
                     if i >= np {
                         break;
                     }
-                    dedup_clicks(cl_raw, i, lm, &mut sc, &mut out, log_p);
+                    dedup_clicks(cl_raw, i, &mut sc, &mut out, log_p);
                 }
                 out.finish()
             }));
@@ -1253,35 +1290,67 @@ fn run() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(cl_raw);
-    drop(lm);
     let n_ev: usize = evs.iter().map(|t| (0..np).map(|q| t.len(q)).sum::<usize>()).sum();
     let n_cl: usize = cls.iter().map(|t| (0..np).map(|q| t.len(q)).sum::<usize>()).sum();
     log(&t0, &format!("click dedup done: {} events, {} clicks routed", n_ev, n_cl));
 
-    // Phase 4: person partitions (largest first), each thread writes its own user_daily part
+    // Phase 4, round A: user partitions (largest first); unlinked users are walked here, linked users'
+    // records are re-scattered by person name. Round B: person partitions of the re-scattered records.
+    // Each thread keeps one Walker across both rounds and then writes its own user_daily part.
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let mut order: Vec<usize> = (0..np).collect();
     let sizes: Vec<usize> = (0..np).map(|q| evs.iter().map(|t| t.len(q)).sum::<usize>()).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
-    let next = AtomicUsize::new(0);
     let user_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&user_dir).expect("mkdir user_daily");
-    let results: Vec<(Vec<CampCell>, usize)> = std::thread::scope(|s| {
+    let mut walkers: Vec<Walker> = (0..nthreads).map(|_| Walker::new(&ctx, day0, ndays)).collect();
+    let mut radix_tmps: Vec<Vec<u64>> = (0..nthreads).map(|_| Vec::new()).collect();
+    let next = AtomicUsize::new(0);
+    let (evs2, cls2): (Vec<Parts<PRec>>, Vec<Parts<CRec>>) = std::thread::scope(|s| {
         let mut hs = Vec::new();
-        for t in 0..nthreads {
+        for (t, (w, radix_tmp)) in walkers.iter_mut().zip(radix_tmps.iter_mut()).enumerate() {
             let next = &next;
-            let (ctx, evs, cls, order, user_dir) = (&ctx, &evs, &cls, &order, &user_dir);
+            let (evs, cls, order, lm) = (&evs, &cls, &order, &lm);
             hs.push(s.spawn(move || {
                 pin_thread(t);
-                let mut w = Walker::new(ctx, day0, ndays);
-                let mut radix_tmp: Vec<u64> = Vec::new();
+                let mut pout: Scatter<PRec> = Scatter::new(np, est_ev);
+                let mut cout: Scatter<CRec> = Scatter::new(np, est_cl);
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= np {
                         break;
                     }
-                    person_partition(order[i], evs, cls, &mut w, &mut radix_tmp, timing);
+                    user_partition(order[i], evs, cls, lm, w, radix_tmp, &mut pout, &mut cout, log_p, timing);
+                }
+                (pout.finish(), cout.finish())
+            }));
+        }
+        hs.into_iter().map(|h| h.join().unwrap()).unzip()
+    });
+    drop(evs);
+    drop(cls);
+    drop(lm);
+    let n_linked: usize = evs2.iter().map(|t| (0..np).map(|q| t.len(q)).sum::<usize>()).sum();
+    log(&t0, &format!("round A done: {} events of linked persons re-scattered", n_linked));
+    let mut order: Vec<usize> = (0..np).collect();
+    let sizes: Vec<usize> = (0..np).map(|q| evs2.iter().map(|t| t.len(q)).sum::<usize>()).collect();
+    order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
+    let next = AtomicUsize::new(0);
+    let results: Vec<(Vec<CampCell>, usize)> = std::thread::scope(|s| {
+        let mut hs = Vec::new();
+        for (t, (w, radix_tmp)) in walkers.into_iter().zip(radix_tmps.iter_mut()).enumerate() {
+            let next = &next;
+            let (ctx, evs2, cls2, order, user_dir) = (&ctx, &evs2, &cls2, &order, &user_dir);
+            hs.push(s.spawn(move || {
+                pin_thread(t);
+                let mut w = w;
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= np {
+                        break;
+                    }
+                    person_partition(order[i], evs2, cls2, &mut w, radix_tmp, timing);
                 }
                 let n_rows = w.rows.len();
                 if n_rows > 0 || t == 0 {
