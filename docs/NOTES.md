@@ -135,3 +135,9 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
 - 2026-11-22 ~12:00 ET: SURVEY of fast public entries (Xero 0.90, Eagle Eye 0.94, Teti 1.01): 3 materializations, person resolved
   at dedup time via flat prefetched link-id map + negative filter (no intern phase), u64 order-preserving keys, mmap input
   (scorer /data reportedly tmpfs), hand-rolled uncompressed parquet, _exit. Branch v3 = restructure to that shape.
+- 2026-11-22 ~12:40 ET: v3 landed on branch v3 (047e9a1): parse -> 32 B raw by event id -> dedup resolves person via LinkMap
+  (flat open-addressed key->name + bit filter, prefetched) and emits 16 B PRec by person -> person partition does local ids,
+  counting sort, per-person sort+walk, per-thread parquet. Fallback (non-packable) IDs now go to a global mutex registry, so
+  PKey compares by u64 only (no Side tables). 36/36 fixtures, dev MATCH. Mac stage log 10M: parse 0.46, dedup 0.17, click
+  dedup 0.02, persons 0.10, total 0.76 s (v2 1.10 s same run). CI A/B vs 2bf102e: run 44877150577. Ten-seed check running.
+  Old main.rs saved as docs/main_v2_final_backup.rs.txt.
