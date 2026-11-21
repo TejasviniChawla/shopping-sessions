@@ -16,17 +16,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ts::{parse_f1, parse_ingest, parse_ts_cached, DAY};
-use util::{pin_thread, prefetch, HugeVec, PKey, Scatter, Side, SmallTable};
+use util::{pin_thread, prefetch, PKey, Parts, Scatter, Side, SmallTable};
 
-const LOG_P: u32 = 5;
-const P: usize = 1 << LOG_P;
 const SESSION_GAP: i64 = 30 * ts::MINUTE;
 const LATE: i64 = DAY;
 const REACH: i64 = 7 * DAY;
 
 #[inline(always)]
-fn part(h: u64) -> usize {
-    (h >> (64 - LOG_P)) as usize
+fn part(h: u64, log_p: u32) -> usize {
+    (h >> (64 - log_p)) as usize
+}
+
+/// Partition count: about 16k records per partition, at most 256 partitions (write streams per thread; CI sweep pending);
+/// dedup sub-buckets each partition further so its table stays inside L2.
+fn choose_log_p(n_est: usize) -> u32 {
+    let mut lp = 6;
+    while lp < 8 && (n_est >> lp) > 16000 {
+        lp += 1;
+    }
+    lp
 }
 
 // ---------- records ----------
@@ -63,6 +71,7 @@ struct ClRaw {
     ts: u32, // ms since window_start - 7 days (valid only when flag bit0)
     camp: u16,
     flags: u8, // bit0 ts ok, bit1 user nonempty, bit2 campaign known
+    _pad: [u8; 9],
 }
 
 /// A validated click routed to its person partition.
@@ -72,6 +81,7 @@ struct CRec {
     id: PKey,
     ts: u32,
     camp: u16,
+    _pad: [u8; 10],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -99,6 +109,7 @@ struct Ctx {
     camp_names: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
     nthreads: usize,
+    log_p: u32,
 }
 
 /// Shared raw pointer for disjoint parallel writes.
@@ -256,46 +267,7 @@ fn parse_click_line(ctx: &Ctx, side: &mut Side, line: &[u8], masks: Option<(u128
         flags |= 4;
         camp = c as u16;
     }
-    Some(ClRaw { id: PKey::new(f[0]), user: PKey::new(f[1]), ts, camp, flags })
-}
-
-/// Parallel parse over work units; each thread produces P partition vectors.
-fn parse_parallel<T: Copy + Default + Send, F>(ctx: &Ctx, inputs: &io::Inputs, units: &[Unit], f: F) -> Vec<Vec<HugeVec<T>>>
-where
-    F: Fn(&Ctx, &mut Side, &[u8], Option<(u128, u128)>, &mut Scatter<T, P>) + Sync,
-{
-    let next = AtomicUsize::new(0);
-    let total_bytes: u64 = units.iter().map(|u| u.end - u.start).sum();
-    let est = (total_bytes / 60) as usize / ctx.nthreads / P + 1024;
-    std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        for t in 0..ctx.nthreads {
-            let next = &next;
-            let f = &f;
-            handles.push(s.spawn(move || {
-                pin_thread(t);
-                let mut side = Side::new();
-                let mut out: Scatter<T, P> = Scatter::new(est);
-                let mut buf = Buffer::new();
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= units.len() {
-                        break;
-                    }
-                    let u = units[i];
-                    buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-                    let (lo, hi) = (buf.lo, buf.hi);
-                    let data = buf.data();
-                    let mut sc = Scanner::new(data, lo, hi);
-                    while let Some((line, masks)) = sc.next() {
-                        f(ctx, &mut side, line, masks, &mut out);
-                    }
-                }
-                out.finish()
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+    Some(ClRaw { id: PKey::new(f[0]), user: PKey::new(f[1]), ts, camp, flags, _pad: [0; 9] })
 }
 
 // ---------- link map: user key -> person name key, for linked IDs only ----------
@@ -404,18 +376,14 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 }
 
 /// Builds the link map from parsed links: dense ids, union-find, byte-minimal name per component.
-fn build_link_map(links: &[Vec<HugeVec<LinkRaw>>]) -> LinkMap {
-    let n_lines: usize = links.iter().map(|t| t.iter().map(|v| v.len()).sum::<usize>()).sum();
+fn build_link_map(links: &[LinkRaw]) -> LinkMap {
+    let n_lines = links.len();
     let mut table = IdTable::new(n_lines + 64);
     let mut edges: Vec<(u32, u32)> = Vec::with_capacity(n_lines);
-    for t in links {
-        for v in t {
-            for l in v.iter() {
-                let a = table.get_or_insert(l.a.0);
-                let b = table.get_or_insert(l.b.0);
-                edges.push((a, b));
-            }
-        }
+    for l in links {
+        let a = table.get_or_insert(l.a.0);
+        let b = table.get_or_insert(l.b.0);
+        edges.push((a, b));
     }
     let n = table.keys.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -475,38 +443,6 @@ fn build_link_map(links: &[Vec<HugeVec<LinkRaw>>]) -> LinkMap {
 
 // ---------- dedup ----------
 
-/// 2-bit saturating counters, 32 slots per record: a record whose slot count is < 2 has a unique key in
-/// this partition and skips the exact table.
-struct Sketch {
-    words: Vec<u64>,
-    mask: usize,
-}
-impl Sketch {
-    fn reuse(mut words: Vec<u64>, total: usize) -> Self {
-        let slots = (total * 32).max(1024).next_power_of_two();
-        words.clear();
-        words.resize(slots / 32, 0);
-        Sketch { words, mask: slots - 1 }
-    }
-    #[inline(always)]
-    fn bump(&mut self, h: u64) {
-        let slot = (h as usize) & self.mask;
-        let w = &mut self.words[slot >> 5];
-        let sh = (slot & 31) * 2;
-        let v = (*w >> sh) & 3;
-        *w += ((v < 2) as u64) << sh;
-    }
-    #[inline(always)]
-    fn count(&self, h: u64) -> u64 {
-        let slot = (h as usize) & self.mask;
-        (self.words[slot >> 5] >> ((slot & 31) * 2)) & 3
-    }
-    #[inline(always)]
-    fn prefetch(&self, h: u64) {
-        prefetch(unsafe { self.words.as_ptr().add(((h as usize) & self.mask) >> 5) });
-    }
-}
-
 #[inline(always)]
 fn event_ok(r: &EvRaw) -> bool {
     let etype = r.flags >> 4;
@@ -516,197 +452,159 @@ fn event_ok(r: &EvRaw) -> bool {
 /// Per-thread scratch reused across partition tasks.
 #[derive(Default)]
 struct Scratch {
-    sketch: Vec<u64>,
-    slots: Vec<(u32, i32, PKey)>,
+    slots: Vec<(u64, i32, u32)>,
     win: Vec<u64>,
-    cands: Vec<u32>,
-    used: Vec<bool>,
-    ckeys: Vec<PKey>,
+    ckeys: Vec<u64>,
+    recs: Vec<EvRaw>,
+    starts: Vec<u32>,
 }
+
+/// Records per dedup sub-bucket: a 2x table of 16-byte slots for this many records is 256 KB.
+const SUB_TARGET: usize = 8000;
 
 #[inline(always)]
 fn person_key(user: PKey, lm: &LinkMap) -> u64 {
     lm.get(user.0, user.hash()).unwrap_or(user.0)
 }
 
-/// Per partition p: dedup event copies by event_id keeping min ingest, validate, resolve the person and
-/// scatter 16-byte records by person key.
-fn dedup_events(raws: &[Vec<HugeVec<EvRaw>>], p: usize, lm: &LinkMap, sc: &mut Scratch) -> Vec<HugeVec<PRec>> {
-    let total: usize = raws.iter().map(|t| t[p].len()).sum();
-    const D: usize = 16;
-    let mut sk = Sketch::reuse(std::mem::take(&mut sc.sketch), total);
-    for tv in raws.iter() {
-        let recs = &tv[p][..];
-        let n = recs.len();
-        for i in 0..n.min(D) {
-            sk.prefetch(recs[i].id.hash());
-        }
-        for i in 0..n {
-            if i + D < n {
-                sk.prefetch(recs[i + D].id.hash());
+const PF: usize = 24;
+
+/// Partition p: records are copied into the thread's scratch grouped by sub-bucket (a few hash bits below
+/// the partition bits), each sub-bucket is deduped in an L2-resident table keyed by event id keeping the
+/// copy with the smallest ingest, then survivors are walked in order, validated, resolved to a person and
+/// pushed to the thread's scatter.
+fn dedup_events(raws: &[Parts<EvRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch, out: &mut Scatter<PRec>, log_p: u32) {
+    let total: usize = raws.iter().map(|r| r.len(p)).sum();
+    if total == 0 {
+        return;
+    }
+    let mut log_sb = 0u32;
+    while (total >> log_sb) > SUB_TARGET && log_sb < 8 {
+        log_sb += 1;
+    }
+    let nsb = 1usize << log_sb;
+    let shift = 64 - log_p - log_sb;
+    // counting sort of the partition's records by sub-bucket into the scratch copy
+    let starts = &mut sc.starts;
+    starts.clear();
+    starts.resize(nsb + 1, 0);
+    for r in raws {
+        for sl in r.get(p) {
+            for rec in sl {
+                starts[((rec.id.hash() >> shift) as usize & (nsb - 1)) + 1] += 1;
             }
-            sk.bump(recs[i].id.hash());
         }
     }
-    let mut out: Scatter<PRec, P> = Scatter::new(total / P + 1024);
-    let mut cands: Vec<u32> = std::mem::take(&mut sc.cands);
-    cands.clear();
-    let mut off = vec![0usize; raws.len() + 1];
-    for t in 0..raws.len() {
-        off[t + 1] = off[t] + raws[t][p].len();
+    for i in 0..nsb {
+        starts[i + 1] += starts[i];
     }
-    const D2: usize = 6;
-    for (t, tv) in raws.iter().enumerate() {
-        let recs = &tv[p][..];
-        let n = recs.len();
-        for i in 0..n.min(D2) {
-            sk.prefetch(recs[i].id.hash());
-            lm.prefetch(recs[i].user.hash());
-        }
-        for (i, r) in recs.iter().enumerate() {
-            if i + D2 < n {
-                let nx = &recs[i + D2];
-                sk.prefetch(nx.id.hash());
-                lm.prefetch(nx.user.hash());
-            }
-            let h = r.id.hash();
-            if sk.count(h) < 2 {
-                if event_ok(r) {
-                    let pk = person_key(r.user, lm);
-                    out.push(part(PKey(pk).hash()), PRec { pkey: pk, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
+    let recs = &mut sc.recs;
+    recs.clear();
+    recs.resize(total, EvRaw::default());
+    {
+        let mut pos: Vec<u32> = starts[..nsb].to_vec();
+        for r in raws {
+            for sl in r.get(p) {
+                for rec in sl {
+                    let b = (rec.id.hash() >> shift) as usize & (nsb - 1);
+                    recs[pos[b] as usize] = *rec;
+                    pos[b] += 1;
                 }
-            } else {
-                cands.push(((t as u32) << 27) | (i as u32));
             }
         }
     }
-    // candidates: exact table keyed by event id, min ingest wins
-    let cap = (cands.len() * 2).max(64).next_power_of_two();
-    let mask = cap - 1;
-    let mut slots = std::mem::take(&mut sc.slots);
-    slots.clear();
-    slots.resize(cap, (u32::MAX, 0, PKey(0)));
-    let mut win = std::mem::take(&mut sc.win);
+    let win = &mut sc.win;
     win.clear();
-    win.resize((total + 63) / 64 + 1, 0);
-    let get = |packed: u32| -> &EvRaw { &raws[(packed >> 27) as usize][p][(packed & 0x7FF_FFFF) as usize] };
-    let nc = cands.len();
-    for k in 0..nc.min(D) {
-        prefetch(unsafe { slots.as_ptr().add((get(cands[k]).id.hash() as usize) & mask) });
-    }
-    for k in 0..nc {
-        if k + D < nc {
-            prefetch(unsafe { slots.as_ptr().add((get(cands[k + D]).id.hash() as usize) & mask) });
-        }
-        let packed = cands[k];
-        let r = get(packed);
-        let h = r.id.hash();
-        let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
-        let mut s = (h as usize) & mask;
-        loop {
-            let (cur, cing, ck) = slots[s];
-            if cur == u32::MAX {
-                slots[s] = (packed, r.ingest, r.id);
-                win[dense >> 6] |= 1 << (dense & 63);
-                break;
-            }
-            if ck == r.id {
-                if r.ingest < cing {
-                    slots[s] = (packed, r.ingest, r.id);
-                    let od = off[(cur >> 27) as usize] + (cur & 0x7FF_FFFF) as usize;
-                    win[od >> 6] &= !(1 << (od & 63));
-                    win[dense >> 6] |= 1 << (dense & 63);
-                }
-                break;
-            }
-            s = (s + 1) & mask;
-        }
-    }
-    for &packed in &cands {
-        let dense = off[(packed >> 27) as usize] + (packed & 0x7FF_FFFF) as usize;
-        if (win[dense >> 6] >> (dense & 63)) & 1 == 0 {
+    win.resize(total / 64 + 1, 0);
+    let slots = &mut sc.slots;
+    for b in 0..nsb {
+        let (lo, hi) = (starts[b] as usize, starts[b + 1] as usize);
+        if lo == hi {
             continue;
         }
-        let r = get(packed);
-        if event_ok(r) {
-            let pk = person_key(r.user, lm);
-            out.push(part(PKey(pk).hash()), PRec { pkey: pk, ts: r.ts, packed: pack_ev(r.price, r.cat, (r.flags >> 4) == 2) });
+        let cap = ((hi - lo) * 2).max(64).next_power_of_two();
+        let mask = cap - 1;
+        slots.clear();
+        slots.resize(cap, (0, 0, 0));
+        for dense in lo..hi {
+            let rec = &recs[dense];
+            let key = rec.id.0;
+            let mut s = (rec.id.hash() as usize) & mask;
+            loop {
+                let (k, ing, d) = slots[s];
+                if k == 0 {
+                    slots[s] = (key, rec.ingest, dense as u32);
+                    win[dense >> 6] |= 1 << (dense & 63);
+                    break;
+                }
+                if k == key {
+                    if rec.ingest < ing {
+                        slots[s] = (key, rec.ingest, dense as u32);
+                        win[(d >> 6) as usize] &= !(1 << (d & 63));
+                        win[dense >> 6] |= 1 << (dense & 63);
+                    }
+                    break;
+                }
+                s = (s + 1) & mask;
+            }
         }
     }
-    sc.sketch = sk.words;
-    sc.slots = slots;
-    sc.win = win;
-    sc.cands = cands;
-    out.finish()
+    let n = total;
+    for i in 0..n.min(PF) {
+        lm.prefetch(recs[i].user.hash());
+    }
+    for dense in 0..n {
+        if dense + PF < n {
+            lm.prefetch(recs[dense + PF].user.hash());
+        }
+        if (win[dense >> 6] >> (dense & 63)) & 1 != 0 {
+            let rec = &recs[dense];
+            if event_ok(rec) {
+                let pk = person_key(rec.user, lm);
+                out.push(part(PKey(pk).hash(), log_p), PRec { pkey: pk, ts: rec.ts, packed: pack_ev(rec.price, rec.cat, (rec.flags >> 4) == 2) });
+            }
+        }
+    }
 }
 
-fn dedup_clicks(raws: &[Vec<HugeVec<ClRaw>>], p: usize, lm: &LinkMap, sc: &mut Scratch) -> Vec<HugeVec<CRec>> {
-    let total: usize = raws.iter().map(|t| t[p].len()).sum();
-    const D: usize = 16;
-    let mut sk = Sketch::reuse(std::mem::take(&mut sc.sketch), total);
-    for tv in raws.iter() {
-        let recs = &tv[p][..];
-        let n = recs.len();
-        for i in 0..n.min(D) {
-            sk.prefetch(recs[i].id.hash());
-        }
-        for i in 0..n {
-            if i + D < n {
-                sk.prefetch(recs[i + D].id.hash());
-            }
-            sk.bump(recs[i].id.hash());
-        }
-    }
-    let cap = (total / 4).max(64).next_power_of_two();
+/// Partition p of clicks: the first copy of each click id is kept (copies are identical).
+fn dedup_clicks(raws: &[Parts<ClRaw>], p: usize, lm: &LinkMap, sc: &mut Scratch, out: &mut Scatter<CRec>, log_p: u32) {
+    let total: usize = raws.iter().map(|r| r.len(p)).sum();
+    let cap = (total * 2).max(64).next_power_of_two();
     let mask = cap - 1;
-    let mut slots = std::mem::take(&mut sc.ckeys);
+    let slots = &mut sc.ckeys;
     slots.clear();
-    slots.resize(cap, PKey(0));
-    let mut used = std::mem::take(&mut sc.used);
-    used.clear();
-    used.resize(cap, false);
-    let mut out: Scatter<CRec, P> = Scatter::new(total / P + 1024);
-    const D2: usize = 6;
-    for tv in raws.iter() {
-        let recs = &tv[p][..];
-        let n = recs.len();
-        for i in 0..n.min(D2) {
-            sk.prefetch(recs[i].id.hash());
-            lm.prefetch(recs[i].user.hash());
-        }
-        for (i, r) in recs.iter().enumerate() {
-            if i + D2 < n {
-                let nx = &recs[i + D2];
-                sk.prefetch(nx.id.hash());
-                lm.prefetch(nx.user.hash());
+    slots.resize(cap, 0);
+    for r in raws {
+        for sl in r.get(p) {
+            let n = sl.len();
+            for i in 0..n.min(PF) {
+                lm.prefetch(sl[i].user.hash());
             }
-            let h = r.id.hash();
-            let fresh = if sk.count(h) < 2 {
-                true
-            } else {
-                let mut s = (h as usize) & mask;
-                loop {
-                    if !used[s] {
-                        used[s] = true;
-                        slots[s] = r.id;
+            for (i, rec) in sl.iter().enumerate() {
+                if i + PF < n {
+                    lm.prefetch(sl[i + PF].user.hash());
+                }
+                let key = rec.id.0;
+                let mut s = (rec.id.hash() as usize) & mask;
+                let fresh = loop {
+                    let k = slots[s];
+                    if k == 0 {
+                        slots[s] = key;
                         break true;
                     }
-                    if slots[s] == r.id {
+                    if k == key {
                         break false;
                     }
                     s = (s + 1) & mask;
+                };
+                if fresh && (rec.flags & 7) == 7 {
+                    let pk = person_key(rec.user, lm);
+                    out.push(part(PKey(pk).hash(), log_p), CRec { pkey: pk, id: rec.id, ts: rec.ts, camp: rec.camp, _pad: [0; 10] });
                 }
-            };
-            if fresh && (r.flags & 7) == 7 {
-                let pk = person_key(r.user, lm);
-                out.push(part(PKey(pk).hash()), CRec { pkey: pk, id: r.id, ts: r.ts, camp: r.camp });
             }
         }
     }
-    sc.sketch = sk.words;
-    sc.ckeys = slots;
-    sc.used = used;
-    out.finish()
 }
 
 // ---------- sorting and walking ----------
@@ -954,54 +852,56 @@ impl LocalIds {
 /// One person partition: local ids, counting sort of events and clicks, per-person sort + walk.
 fn person_partition(
     q: usize,
-    evs: &[Vec<HugeVec<PRec>>],
-    cls: &[Vec<HugeVec<CRec>>],
+    evs: &[Parts<PRec>],
+    cls: &[Parts<CRec>],
     w: &mut Walker,
     radix_tmp: &mut Vec<u64>,
 ) {
-    let nev: usize = evs.iter().map(|t| t[q].len()).sum();
-    let ncl: usize = cls.iter().map(|t| t[q].len()).sum();
+    let nev: usize = evs.iter().map(|t| t.len(q)).sum();
+    let ncl: usize = cls.iter().map(|t| t.len(q)).sum();
     let mut ids = LocalIds::new(nev / 12 + ncl / 12 + 64);
     const D: usize = 8;
     // pass A: local ids + counts (ids stored per record to avoid re-probing)
     let mut ev_lid: Vec<u32> = Vec::with_capacity(nev);
     let mut cnt: Vec<u32> = Vec::new();
     for t in evs {
-        let recs = &t[q][..];
-        let n = recs.len();
-        for i in 0..n.min(D) {
-            ids.prefetch(PKey(recs[i].pkey).hash());
-        }
-        for (i, r) in recs.iter().enumerate() {
-            if i + D < n {
-                ids.prefetch(PKey(recs[i + D].pkey).hash());
+        for recs in t.get(q) {
+            let n = recs.len();
+            for i in 0..n.min(D) {
+                ids.prefetch(PKey(recs[i].pkey).hash());
             }
-            let l = ids.get_or_insert(r.pkey, PKey(r.pkey).hash());
-            if l as usize >= cnt.len() {
-                cnt.resize(l as usize + 1, 0);
+            for (i, r) in recs.iter().enumerate() {
+                if i + D < n {
+                    ids.prefetch(PKey(recs[i + D].pkey).hash());
+                }
+                let l = ids.get_or_insert(r.pkey, PKey(r.pkey).hash());
+                if l as usize >= cnt.len() {
+                    cnt.resize(l as usize + 1, 0);
+                }
+                cnt[l as usize] += 1;
+                ev_lid.push(l);
             }
-            cnt[l as usize] += 1;
-            ev_lid.push(l);
         }
     }
     let mut cl_lid: Vec<u32> = Vec::with_capacity(ncl);
     let mut ccnt: Vec<u32> = Vec::new();
     for t in cls {
-        let recs = &t[q][..];
-        let n = recs.len();
-        for i in 0..n.min(D) {
-            ids.prefetch(PKey(recs[i].pkey).hash());
-        }
-        for (i, r) in recs.iter().enumerate() {
-            if i + D < n {
-                ids.prefetch(PKey(recs[i + D].pkey).hash());
+        for recs in t.get(q) {
+            let n = recs.len();
+            for i in 0..n.min(D) {
+                ids.prefetch(PKey(recs[i].pkey).hash());
             }
-            let l = ids.get_or_insert(r.pkey, PKey(r.pkey).hash());
-            if l as usize >= ccnt.len() {
-                ccnt.resize(l as usize + 1, 0);
+            for (i, r) in recs.iter().enumerate() {
+                if i + D < n {
+                    ids.prefetch(PKey(recs[i + D].pkey).hash());
+                }
+                let l = ids.get_or_insert(r.pkey, PKey(r.pkey).hash());
+                if l as usize >= ccnt.len() {
+                    ccnt.resize(l as usize + 1, 0);
+                }
+                ccnt[l as usize] += 1;
+                cl_lid.push(l);
             }
-            ccnt[l as usize] += 1;
-            cl_lid.push(l);
         }
     }
     let np = ids.keys.len();
@@ -1019,24 +919,28 @@ fn person_partition(
     let mut pos: Vec<u32> = estart[..np].to_vec();
     let mut k = 0usize;
     for t in evs {
-        for r in t[q].iter() {
-            let l = ev_lid[k] as usize;
-            k += 1;
-            let d = pos[l];
-            pos[l] += 1;
-            ev_sorted[d as usize] = ((r.ts as u64) << 32) | r.packed as u64;
+        for sl in t.get(q) {
+            for r in sl {
+                let l = ev_lid[k] as usize;
+                k += 1;
+                let d = pos[l];
+                pos[l] += 1;
+                ev_sorted[d as usize] = ((r.ts as u64) << 32) | r.packed as u64;
+            }
         }
     }
     let mut cl_sorted: Vec<ClFinal> = vec![ClFinal::default(); ncl];
     let mut cpos: Vec<u32> = cstart[..np].to_vec();
     let mut k = 0usize;
     for t in cls {
-        for r in t[q].iter() {
-            let l = cl_lid[k] as usize;
-            k += 1;
-            let d = cpos[l];
-            cpos[l] += 1;
-            cl_sorted[d as usize] = ClFinal { id: r.id, ts: r.ts, camp: r.camp };
+        for sl in t.get(q) {
+            for r in sl {
+                let l = cl_lid[k] as usize;
+                k += 1;
+                let d = cpos[l];
+                cpos[l] += 1;
+                cl_sorted[d as usize] = ClFinal { id: r.id, ts: r.ts, camp: r.camp };
+            }
         }
     }
     drop(ev_lid);
@@ -1144,115 +1048,151 @@ fn run() {
     channels.push(b"organic".to_vec());
 
     let inputs = io::discover(&data);
-    let ctx = Ctx { ws, we, products, campaigns, ncat, cat_names, cat_rank, ncamp, camp_names, channels, nthreads };
-    log(&t0, &format!("setup: {} files, {} threads, {} event units", inputs.files.len(), nthreads, inputs.events.len()));
+    let ev_bytes: u64 = inputs.events.iter().map(|u| u.end - u.start).sum();
+    let cl_bytes: u64 = inputs.clicks.iter().map(|u| u.end - u.start).sum();
+    let n_est = (ev_bytes / 75) as usize + 1024;
+    let log_p = std::env::var("LOG_P").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| choose_log_p(n_est));
+    let np = 1usize << log_p;
+    let ctx = Ctx { ws, we, products, campaigns, ncat, cat_names, cat_rank, ncamp, camp_names, channels, nthreads, log_p };
+    log(&t0, &format!("setup: {} files, {} threads, {} event units, {} partitions", inputs.files.len(), nthreads, inputs.events.len(), np));
 
-    // Phase 1: links (small) -> link map; then events
-    let links = parse_parallel(&ctx, &inputs, &inputs.links, |_c, _side, line, masks, out| {
-        let mut f = [&b""[..]; 2];
-        if !split_scanned(line, masks, &mut f) || f[0].is_empty() || f[1].is_empty() {
-            return;
-        }
-        out.push(0, LinkRaw { a: PKey::new(f[0]), b: PKey::new(f[1]) });
-    });
-    // the link map is built on its own thread while events are parsed
-    let (ev_raw, lm) = std::thread::scope(|s| {
-        let h = s.spawn(|| build_link_map(&links));
-        let ev_raw = parse_parallel(&ctx, &inputs, &inputs.events, |c, side, line, masks, out| {
-            if let Some(r) = parse_event_line(c, side, line, masks) {
-                out.push(part(r.id.hash()), r);
-            }
-        });
-        (ev_raw, h.join().unwrap())
-    });
-    drop(links);
-    log(&t0, "events parsed, link map built");
-
-    // Phase 2 (overlapped): event dedup partitions and click parse units share one task queue
-    let n_cu = inputs.clicks.len();
-    let cl_est = (inputs.clicks.iter().map(|u| u.end - u.start).sum::<u64>() / 40) as usize / nthreads / P + 1024;
+    // Phase 1: one task queue: task 0 = parse links + build the link map (one worker), the rest = event units
+    let est_ev = n_est / nthreads / np + 64;
     let next = AtomicUsize::new(0);
-    let mut evp_out: Vec<Option<Vec<HugeVec<PRec>>>> = (0..P).map(|_| None).collect();
-    let cl_raw: Vec<Vec<HugeVec<ClRaw>>> = {
-        let evp = Shared(evp_out.as_mut_ptr());
+    let mut lm_slot: Option<LinkMap> = None;
+    let ev_raw: Vec<Parts<EvRaw>> = {
+        let lm_ptr = Shared(&mut lm_slot as *mut Option<LinkMap>);
         std::thread::scope(|s| {
             let mut hs = Vec::new();
             for t in 0..nthreads {
                 let next = &next;
-                let (ctx, inputs, ev_raw, lm) = (&ctx, &inputs, &ev_raw, &lm);
+                let (ctx, inputs) = (&ctx, &inputs);
                 hs.push(s.spawn(move || {
                     pin_thread(t);
-                    let mut sc = Scratch::default();
-                    let mut cout: Scatter<ClRaw, P> = Scatter::new(cl_est);
                     let mut side = Side::new();
+                    let mut out: Scatter<EvRaw> = Scatter::new(np, est_ev);
                     let mut buf = Buffer::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i < P {
-                            let r = dedup_events(ev_raw, i, lm, &mut sc);
-                            unsafe { *evp.p().add(i) = Some(r) };
-                        } else if i < P + n_cu {
-                            let u = inputs.clicks[i - P];
+                        if i == 0 {
+                            let mut links: Vec<LinkRaw> = Vec::new();
+                            for u in &inputs.links {
+                                buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], *u);
+                                let (lo, hi) = (buf.lo, buf.hi);
+                                let data = buf.data();
+                                let mut scn = Scanner::new(data, lo, hi);
+                                while let Some((line, masks)) = scn.next() {
+                                    let mut f = [&b""[..]; 2];
+                                    if split_scanned(line, masks, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+                                        links.push(LinkRaw { a: PKey::new(f[0]), b: PKey::new(f[1]) });
+                                    }
+                                }
+                            }
+                            let lm = build_link_map(&links);
+                            unsafe { *lm_ptr.p() = Some(lm) };
+                        } else if i - 1 < inputs.events.len() {
+                            let u = inputs.events[i - 1];
                             buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
                             let (lo, hi) = (buf.lo, buf.hi);
                             let data = buf.data();
-                            let mut scn = Scanner::new(data, lo, hi);
-                            while let Some((line, masks)) = scn.next() {
-                                if let Some(r) = parse_click_line(ctx, &mut side, line, masks) {
-                                    cout.push(part(r.id.hash()), r);
+                            let mut sc = Scanner::new(data, lo, hi);
+                            while let Some((line, masks)) = sc.next() {
+                                if let Some(r) = parse_event_line(ctx, &mut side, line, masks) {
+                                    out.push(part(r.id.hash(), log_p), r);
                                 }
                             }
                         } else {
                             break;
                         }
                     }
-                    cout.finish()
+                    out.finish()
                 }));
             }
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         })
     };
+    let lm = lm_slot.expect("link map");
+    log(&t0, "events parsed, link map built");
+
+    // Phase 2 (overlapped): event dedup partitions and click parse units share one task queue;
+    // each thread owns one person-scatter for all the dedup tasks it runs.
+    let n_cu = inputs.clicks.len();
+    let est_cl = (cl_bytes / 45) as usize / nthreads / np + 64;
+    let next = AtomicUsize::new(0);
+    let (evs, cl_raw): (Vec<Parts<PRec>>, Vec<Parts<ClRaw>>) = std::thread::scope(|s| {
+        let mut hs = Vec::new();
+        for t in 0..nthreads {
+            let next = &next;
+            let (ctx, inputs, ev_raw, lm) = (&ctx, &inputs, &ev_raw, &lm);
+            hs.push(s.spawn(move || {
+                pin_thread(t);
+                let mut sc = Scratch::default();
+                let mut pout: Scatter<PRec> = Scatter::new(np, est_ev);
+                let mut cout: Scatter<ClRaw> = Scatter::new(np, est_cl);
+                let mut side = Side::new();
+                let mut buf = Buffer::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i < np {
+                        dedup_events(ev_raw, i, lm, &mut sc, &mut pout, log_p);
+                    } else if i < np + n_cu {
+                        let u = inputs.clicks[i - np];
+                        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+                        let (lo, hi) = (buf.lo, buf.hi);
+                        let data = buf.data();
+                        let mut scn = Scanner::new(data, lo, hi);
+                        while let Some((line, masks)) = scn.next() {
+                            if let Some(r) = parse_click_line(ctx, &mut side, line, masks) {
+                                cout.push(part(r.id.hash(), log_p), r);
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                (pout.finish(), cout.finish())
+            }));
+        }
+        hs.into_iter().map(|h| h.join().unwrap()).unzip()
+    });
     drop(ev_raw);
     drop(inputs);
-    let evs: Vec<Vec<HugeVec<PRec>>> = evp_out.into_iter().map(|x| x.unwrap()).collect();
     log(&t0, "event dedup + click parse done");
 
     // Phase 3: click dedup
     let next = AtomicUsize::new(0);
-    let mut clp_out: Vec<Option<Vec<HugeVec<CRec>>>> = (0..P).map(|_| None).collect();
-    {
-        let clp = Shared(clp_out.as_mut_ptr());
-        std::thread::scope(|s| {
-            for t in 0..nthreads {
-                let next = &next;
-                let (cl_raw, lm) = (&cl_raw, &lm);
-                s.spawn(move || {
-                    pin_thread(t);
-                    let mut sc = Scratch::default();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= P {
-                            break;
-                        }
-                        let r = dedup_clicks(cl_raw, i, lm, &mut sc);
-                        unsafe { *clp.p().add(i) = Some(r) };
+    let cls: Vec<Parts<CRec>> = std::thread::scope(|s| {
+        let mut hs = Vec::new();
+        for t in 0..nthreads {
+            let next = &next;
+            let (cl_raw, lm) = (&cl_raw, &lm);
+            hs.push(s.spawn(move || {
+                pin_thread(t);
+                let mut sc = Scratch::default();
+                let mut out: Scatter<CRec> = Scatter::new(np, est_cl);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= np {
+                        break;
                     }
-                });
-            }
-        });
-    }
+                    dedup_clicks(cl_raw, i, lm, &mut sc, &mut out, log_p);
+                }
+                out.finish()
+            }));
+        }
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     drop(cl_raw);
     drop(lm);
-    let cls: Vec<Vec<HugeVec<CRec>>> = clp_out.into_iter().map(|x| x.unwrap()).collect();
-    let n_ev: usize = evs.iter().map(|t| t.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let n_cl: usize = cls.iter().map(|t| t.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let n_ev: usize = evs.iter().map(|t| (0..np).map(|q| t.len(q)).sum::<usize>()).sum();
+    let n_cl: usize = cls.iter().map(|t| (0..np).map(|q| t.len(q)).sum::<usize>()).sum();
     log(&t0, &format!("click dedup done: {} events, {} clicks routed", n_ev, n_cl));
 
     // Phase 4: person partitions (largest first), each thread writes its own user_daily part
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
-    let mut order: Vec<usize> = (0..P).collect();
-    let sizes: Vec<usize> = (0..P).map(|q| evs.iter().map(|t| t[q].len()).sum::<usize>()).collect();
+    let mut order: Vec<usize> = (0..np).collect();
+    let sizes: Vec<usize> = (0..np).map(|q| evs.iter().map(|t| t.len(q)).sum::<usize>()).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
     let next = AtomicUsize::new(0);
     let user_dir = outdir.join("user_daily");
@@ -1268,7 +1208,7 @@ fn run() {
                 let mut radix_tmp: Vec<u64> = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= P {
+                    if i >= np {
                         break;
                     }
                     person_partition(order[i], evs, cls, &mut w, &mut radix_tmp);

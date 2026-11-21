@@ -478,61 +478,135 @@ impl<T: Copy> HugeVec<T> {
     }
 }
 
-/// Software write-combining scatter into P partition vectors: records are staged in small L1-resident
-/// buffers and copied out in 512-byte bursts, so the memory system sees few sequential streams.
-pub struct Scatter<T: Copy, const P: usize> {
-    pub out: Vec<HugeVec<T>>,
-    stage: Vec<[T; 16]>,
-    cnt: [u8; P],
+/// One 64-byte staging line.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct Line(pub [u8; 64]);
+
+/// Partitioned output of one producer: a fixed-capacity region per partition inside one mapping, plus a
+/// rarely used overflow vector per partition. `get(p)` returns the two slices of partition p.
+pub struct Parts<T: Copy> {
+    arena: HugeVec<T>,
+    cap: usize,
+    lens: Vec<u32>,
+    over: Vec<Vec<T>>,
+}
+unsafe impl<T: Copy + Send> Send for Parts<T> {}
+unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
+impl<T: Copy> Parts<T> {
+    #[inline(always)]
+    pub fn get(&self, p: usize) -> [&[T]; 2] {
+        let a = unsafe { std::slice::from_raw_parts(self.arena.ptr.add(p * self.cap), self.lens[p] as usize) };
+        [a, &self.over[p][..]]
+    }
+    #[inline(always)]
+    pub fn len(&self, p: usize) -> usize {
+        self.lens[p] as usize + self.over[p].len()
+    }
+    pub fn nparts(&self) -> usize {
+        self.lens.len()
+    }
 }
 
-impl<T: Copy + Default, const P: usize> Scatter<T, P> {
-    pub fn new(est: usize) -> Self {
+/// Software write-combining scatter into `np` partitions: records are staged in one 64-byte line per
+/// partition and streamed out with non-temporal stores, so the parser's output never pollutes the caches.
+pub struct Scatter<T: Copy> {
+    arena: HugeVec<T>,
+    cap: usize,
+    lens: Vec<u32>,
+    over: Vec<Vec<T>>,
+    stage: Vec<Line>,
+    cnt: Vec<u8>,
+    per: usize,
+}
+
+impl<T: Copy + Default> Scatter<T> {
+    /// `est` = expected records per partition; the region holds 5/4 of that (rounded up to whole lines).
+    pub fn new(np: usize, est: usize) -> Self {
+        let size = std::mem::size_of::<T>();
+        assert!(size > 0 && 64 % size == 0, "record size must divide 64");
+        let per = 64 / size;
+        let cap = ((est + est / 4 + 64) + per - 1) / per * per;
         Scatter {
-            out: (0..P).map(|_| HugeVec::with_capacity(est)).collect(),
-            stage: vec![[T::default(); 16]; P],
-            cnt: [0; P],
+            arena: HugeVec::with_capacity(np * cap),
+            cap,
+            lens: vec![0; np],
+            over: (0..np).map(|_| Vec::new()).collect(),
+            stage: vec![Line([0u8; 64]); np],
+            cnt: vec![0; np],
+            per,
         }
     }
     #[inline(always)]
     pub fn push(&mut self, p: usize, v: T) {
         let c = self.cnt[p] as usize;
-        self.stage[p][c] = v;
-        if c + 1 == 16 {
-            self.out[p].extend_from_slice(&self.stage[p]);
+        unsafe {
+            let dst = (self.stage.as_mut_ptr().add(p) as *mut u8).add(c * std::mem::size_of::<T>()) as *mut T;
+            dst.write(v);
+        }
+        if c + 1 == self.per {
+            self.flush(p);
             self.cnt[p] = 0;
         } else {
             self.cnt[p] = (c + 1) as u8;
         }
     }
-    pub fn finish(mut self) -> Vec<HugeVec<T>> {
-        for p in 0..P {
+    #[inline(always)]
+    fn flush(&mut self, p: usize) {
+        let l = self.lens[p] as usize;
+        if l + self.per <= self.cap {
+            unsafe {
+                let dst = (self.arena.ptr.add(p * self.cap + l)) as *mut u8;
+                let src = self.stage.as_ptr().add(p) as *const u8;
+                stream64(dst, src);
+            }
+            self.lens[p] = (l + self.per) as u32;
+        } else {
+            let src = unsafe { std::slice::from_raw_parts(self.stage.as_ptr().add(p) as *const T, self.per) };
+            self.over[p].extend_from_slice(src);
+        }
+    }
+    pub fn finish(mut self) -> Parts<T> {
+        for p in 0..self.lens.len() {
             let c = self.cnt[p] as usize;
             if c > 0 {
-                let st = self.stage[p];
-                self.out[p].extend_from_slice(&st[..c]);
+                let src = unsafe { std::slice::from_raw_parts(self.stage.as_ptr().add(p) as *const T, c) };
+                let l = self.lens[p] as usize;
+                if l + c <= self.cap {
+                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.arena.ptr.add(p * self.cap + l), c) };
+                    self.lens[p] = (l + c) as u32;
+                } else {
+                    self.over[p].extend_from_slice(src);
+                }
             }
         }
-        self.out
+        sfence();
+        Parts { arena: self.arena, cap: self.cap, lens: self.lens, over: self.over }
     }
 }
 
-impl<T> std::ops::Deref for HugeVec<T> {
-    type Target = [T];
-    #[inline(always)]
-    fn deref(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+/// Copies one 64-byte line with non-temporal stores (dst must be 64-byte aligned).
+#[inline(always)]
+unsafe fn stream64(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let a = _mm256_load_si256(src as *const __m256i);
+        let b = _mm256_load_si256(src.add(32) as *const __m256i);
+        _mm256_stream_si256(dst as *mut __m256i, a);
+        _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        std::ptr::copy_nonoverlapping(src, dst, 64);
     }
 }
-impl<T> std::ops::DerefMut for HugeVec<T> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-impl<T> Drop for HugeVec<T> {
-    fn drop(&mut self) {
-        pool_put(self.ptr as *mut u8, self.bytes);
+
+#[inline(always)]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
     }
 }
 
