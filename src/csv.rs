@@ -103,6 +103,8 @@ pub unsafe fn masks3(p: *const u8) -> (u128, u128, u128) {
         let mut qm: u128 = 0;
         let mut nm: u128 = 0;
         let mut i = 0;
+        // stop after the 32-byte chunk holding the newline: lines are mostly 65..96 bytes (events) or
+        // <= 64 (clicks), so the exit chunk is stable per file and the branch predicts well
         while i < 4 {
             let v = _mm256_loadu_si256(p.add(32 * i) as *const __m256i);
             let c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32 as u128;
@@ -112,6 +114,9 @@ pub unsafe fn masks3(p: *const u8) -> (u128, u128, u128) {
             qm |= q << (32 * i);
             nm |= n << (32 * i);
             i += 1;
+            if n != 0 {
+                break;
+            }
         }
         return (cm, qm, nm);
     }
@@ -153,6 +158,10 @@ pub unsafe fn masks3(p: *const u8) -> (u128, u128, u128) {
             qm |= (movemask16(vceqq_u8(v, quote)) as u128) << (16 * i);
             nm |= (movemask16(vceqq_u8(v, nl)) as u128) << (16 * i);
             i += 1;
+            // exit at 32-byte granularity once the newline has been seen (stable per file, predicts well)
+            if (i & 1) == 0 && nm != 0 {
+                break;
+            }
         }
         return (cm, qm, nm);
     }
