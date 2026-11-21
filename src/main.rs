@@ -838,92 +838,83 @@ impl<'a> Walker<'a> {
 }
 
 /// Micro-benchmark of the parse stages on the event files, single-threaded. Enabled with BENCH=1.
+/// Every stage keeps its results alive with black_box so nothing is optimized away.
 fn bench(ctx: &Ctx, inputs: &io::Inputs) {
+    use std::hint::black_box;
     let units = &inputs.events;
     let mut buf = Buffer::new();
-    let t = Instant::now();
-    let (mut lines, mut bytes) = (0usize, 0usize);
-    for &u in units {
-        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        for l in Lines::new(buf.data(), buf.lo, buf.hi) {
-            lines += 1;
-            bytes += l.len();
-        }
+    macro_rules! stage {
+        ($name:expr, |$line:ident, $m:ident, $side:ident| $body:block) => {{
+            let t = Instant::now();
+            let mut $side = Side::new();
+            let mut lines = 0usize;
+            for &u in units {
+                buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+                let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+                while let Some(($line, $m)) = sc.next() {
+                    lines += 1;
+                    $body
+                }
+            }
+            eprintln!("bench {:<28} {:.3}s  ({} lines)", $name, t.elapsed().as_secs_f64(), lines);
+        }};
     }
-    eprintln!("bench read+lines: {} lines, {} MB, {:.3}s", lines, bytes >> 20, t.elapsed().as_secs_f64());
-    let t = Instant::now();
-    let mut ok = 0usize;
-    for &u in units {
-        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
-        while let Some((l, m)) = sc.next() {
-            let mut f = [&b""[..]; 7];
-            if split_scanned(l, m, &mut f) {
-                ok += f[0].len();
+    stage!("read+scan", |l, m, _sd| { black_box(l.len()); black_box(m); });
+    stage!("+split", |l, m, _sd| {
+        let mut f = [&b""[..]; 7];
+        if split_scanned(l, m, &mut f) { black_box(&f); }
+    });
+    stage!("+split+ts", |l, m, sd| {
+        let mut f = [&b""[..]; 7];
+        if split_scanned(l, m, &mut f) { black_box(parse_ts_cached(f[2], &mut sd.dates)); }
+    });
+    stage!("+split+ts+ingest", |l, m, sd| {
+        let mut f = [&b""[..]; 7];
+        if split_scanned(l, m, &mut f) {
+            black_box(parse_ts_cached(f[2], &mut sd.dates));
+            black_box(parse_ingest(f[3], &mut sd.dates));
+        }
+    });
+    stage!("+split+keys", |l, m, sd| {
+        let mut f = [&b""[..]; 7];
+        if split_scanned(l, m, &mut f) {
+            black_box(PKey::new(f[0], 0, &mut sd));
+            black_box(PKey::new(f[1], 0, &mut sd));
+        }
+    });
+    stage!("+split+type+price+hash", |l, m, sd| {
+        let mut f = [&b""[..]; 7];
+        if split_scanned(l, m, &mut f) {
+            let t = f[4];
+            let w = unsafe { std::ptr::read_unaligned(t.as_ptr() as *const u64) };
+            let et: u8 = if t.len() == 4 && (w as u32) == u32::from_le_bytes(*b"view") { 0 }
+                else if t.len() == 4 && (w as u32) == u32::from_le_bytes(*b"cart") { 1 }
+                else if t.len() == 8 && w == u64::from_le_bytes(*b"purchase") { 2 } else { 3 };
+            black_box(et);
+            if et == 2 { black_box(parse_price(f[6])); black_box(ctx.products.get(f[5])); }
+            let k = PKey::new(f[0], 0, &mut sd);
+            black_box(part(k.hash_in(&sd)));
+        }
+    });
+    stage!("full parse_event_line", |l, m, sd| { black_box(parse_event_line(ctx, 0, &mut sd, l, m)); });
+    {
+        let t = Instant::now();
+        let mut side = Side::new();
+        let mut out: Scatter<EvRaw, P> = Scatter::new(1 << 16);
+        let mut n = 0usize;
+        for &u in units {
+            buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+            let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
+            while let Some((l, m)) = sc.next() {
+                if let Some(r) = parse_event_line(ctx, 0, &mut side, l, m) {
+                    out.push(part(r.id.hash_in(&side)), r);
+                    n += 1;
+                }
             }
         }
+        let o = out.finish();
+        eprintln!("bench {:<28} {:.3}s  ({} records, {} vecs)", "full + scatter push", t.elapsed().as_secs_f64(), n, o.len());
     }
-    eprintln!("bench +split_fields: {} {:.3}s", ok, t.elapsed().as_secs_f64());
-    // split + timestamps only
-    let t = Instant::now();
-    let mut acc = 0i64;
-    let mut dc = Side::new();
-    for &u in units {
-        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
-        while let Some((l, m)) = sc.next() {
-            let mut f = [&b""[..]; 7];
-            if split_scanned(l, m, &mut f) {
-                acc = acc
-                    .wrapping_add(parse_ts_cached(f[2], &mut dc.dates).unwrap_or(0))
-                    .wrapping_add(parse_f1_cached(f[3], &mut dc.dates).unwrap_or(0));
-            }
-        }
-    }
-    eprintln!("bench +split+timestamps: {} {:.3}s", acc, t.elapsed().as_secs_f64());
-    // split + keys only
-    let t = Instant::now();
-    let mut acc = 0u64;
-    let mut side = Side::new();
-    for &u in units {
-        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
-        while let Some((l, m)) = sc.next() {
-            let mut f = [&b""[..]; 7];
-            if split_scanned(l, m, &mut f) {
-                let a = PKey::new(f[0], 0, &mut side);
-                let b = PKey::new(f[1], 0, &mut side);
-                acc = acc.wrapping_add(a.0 ^ b.0);
-            }
-        }
-    }
-    eprintln!("bench +split+keys: {} {:.3}s", acc, t.elapsed().as_secs_f64());
-    let t = Instant::now();
-    let mut acc = 0u64;
-    let mut side = Side::new();
-    for &u in units {
-        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
-        while let Some((l, m)) = sc.next() {
-            if let Some(r) = parse_event_line(ctx, 0, &mut side, l, m) {
-                acc = acc.wrapping_add(r.ts as u64 ^ r.price as u64 ^ r.id.0);
-            }
-        }
-    }
-    eprintln!("bench +parse_event_line: {} {:.3}s", acc, t.elapsed().as_secs_f64());
-    let t = Instant::now();
-    let mut out: Scatter<EvRaw, P> = Scatter::new(lines / P + 16);
-    for &u in units {
-        buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
-        let mut sc = Scanner::new(buf.data(), buf.lo, buf.hi);
-        while let Some((l, m)) = sc.next() {
-            if let Some(r) = parse_event_line(ctx, 0, &mut side, l, m) {
-                out.push(part(r.id.hash_in(&side)), r);
-            }
-        }
-    }
-    let out = out.finish();
-    eprintln!("bench +push: {} {:.3}s", out.iter().map(|v| v.len()).sum::<usize>(), t.elapsed().as_secs_f64());
 }
 
 // ---------- main ----------
