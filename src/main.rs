@@ -11,8 +11,8 @@ use io::{Buffer, Unit};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use ts::{parse_f1, parse_f1_cached, parse_ts, parse_ts_cached, DAY};
-use util::{prefetch, HugeVec, PKey, Scatter, Side, Sides, SmallTable};
+use ts::{parse_f1, parse_f1_cached, parse_ingest, parse_ts, parse_ts_cached, DAY};
+use util::{pin_thread, prefetch, HugeVec, PKey, Scatter, Side, Sides, SmallTable};
 
 const LOG_P: u32 = 5;
 const P: usize = 1 << LOG_P;
@@ -197,7 +197,7 @@ fn parse_event_line(ctx: &Ctx, aid: usize, side: &mut Side, line: &[u8], masks: 
     if !split_scanned(line, masks, &mut f) || f[0].is_empty() {
         return None;
     }
-    let ingest = match parse_f1_cached(f[3], &mut side.dates) {
+    let ingest = match parse_ingest(f[3], &mut side.dates) {
         Some(t) => ((t - ctx.ws) / 1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         None => i32::MAX,
     };
@@ -292,6 +292,7 @@ where
             let next = &next;
             let f = &f;
             handles.push(s.spawn(move || {
+                pin_thread(t);
                 let aid = aid_base + t;
                 let mut side = Side::new();
                 let mut out: Scatter<T, P> = Scatter::new(est);
@@ -1020,55 +1021,115 @@ fn run() {
         parse_event_line(c, aid, side, line, masks).map(|r| (part(r.id.hash_in(side)), r))
     });
     log(&t0, "events parsed");
-    let (cl_raw, sd_c) = parse_parallel(&ctx, &inputs, &inputs.clicks, nthreads, |c, aid, side, line, masks, _| {
-        parse_click_line(c, aid, side, line, masks).map(|r| (part(r.id.hash_in(side)), r))
-    });
-    let (links, sd_l) = parse_parallel(&ctx, &inputs, &inputs.links, 2 * nthreads, |_c, aid, side, line, masks, extra| {
-        let mut f = [&b""[..]; 2];
-        if !split_scanned(line, masks, &mut f) || f[0].is_empty() || f[1].is_empty() {
-            return None;
-        }
-        let a = PKey::new(f[0], aid, side);
-        let b = PKey::new(f[1], aid, side);
-        // the mirrored copy goes to b's partition so every partition sees all of its own IDs locally
-        let (pa, pb) = (part(a.hash_in(side)), part(b.hash_in(side)));
-        extra.push(pb, LinkRaw { a: b, b: a });
-        Some((pa, LinkRaw { a, b }))
-    });
-    log(&t0, "clicks+links parsed");
+    // Phase 2 (overlapped): event dedup partitions, click parse units and link parse units share one task queue.
+    // Event dedup only needs the event parse; clicks and links are parsed by whichever threads are free.
     let mut sides_v: Vec<Side> = Vec::with_capacity(3 * nthreads);
     sides_v.extend(sd_e);
-    sides_v.extend(sd_c);
-    sides_v.extend(sd_l);
-    let sides: &Sides = &sides_v[..];
-    drop(inputs);
-
-    // Phase 2: dedup + validate, per partition
+    for _ in 0..2 * nthreads {
+        sides_v.push(Side::new());
+    }
+    let n_cu = inputs.clicks.len();
+    let n_lu = inputs.links.len();
+    let cl_est = (inputs.clicks.iter().map(|u| u.end - u.start).sum::<u64>() / 40) as usize / nthreads / P + 1024;
+    let lk_est = (inputs.links.iter().map(|u| u.end - u.start).sum::<u64>() / 20) as usize / nthreads / P + 1024;
     let next = AtomicUsize::new(0);
     let mut evv: Vec<Option<Vec<HugeVec<EvValid>>>> = (0..P).map(|_| None).collect();
-    let mut clv: Vec<Option<Vec<HugeVec<ClValid>>>> = (0..P).map(|_| None).collect();
-    {
+    struct Phase2Out {
+        clicks: Vec<HugeVec<ClRaw>>,
+        links: Vec<HugeVec<LinkRaw>>,
+        cside: Side,
+        lside: Side,
+    }
+    let p2: Vec<Phase2Out> = {
         let evp = Shared(evv.as_mut_ptr());
-        let clp = Shared(clv.as_mut_ptr());
+        let sides: &Sides = &sides_v[..];
         std::thread::scope(|s| {
-            for _ in 0..nthreads {
+            let mut hs = Vec::new();
+            for t in 0..nthreads {
                 let next = &next;
-                let ev_raw = &ev_raw;
-                let cl_raw = &cl_raw;
-                s.spawn(move || {
+                let (ctx, inputs, ev_raw) = (&ctx, &inputs, &ev_raw);
+                hs.push(s.spawn(move || {
+                    pin_thread(t);
                     let mut sc = Scratch::default();
+                    let mut cout: Scatter<ClRaw, P> = Scatter::new(cl_est);
+                    let mut lout: Scatter<LinkRaw, P> = Scatter::new(lk_est);
+                    let mut cside = Side::new();
+                    let mut lside = Side::new();
+                    let mut buf = Buffer::new();
+                    let (caid, laid) = (nthreads + t, 2 * nthreads + t);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= 2 * P {
-                            break;
-                        }
                         if i < P {
                             let r = dedup_events(sides, ev_raw, i, &mut sc);
                             unsafe { *evp.p().add(i) = Some(r) };
+                        } else if i < P + n_cu {
+                            let u = inputs.clicks[i - P];
+                            buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+                            let (lo, hi) = (buf.lo, buf.hi);
+                            let data = buf.data();
+                            let mut scn = Scanner::new(data, lo, hi);
+                            while let Some((line, masks)) = scn.next() {
+                                if let Some(r) = parse_click_line(ctx, caid, &mut cside, line, masks) {
+                                    cout.push(part(r.id.hash_in(&cside)), r);
+                                }
+                            }
+                        } else if i < P + n_cu + n_lu {
+                            let u = inputs.links[i - P - n_cu];
+                            buf.load(&inputs.files[u.file as usize], inputs.sizes[u.file as usize], u);
+                            let (lo, hi) = (buf.lo, buf.hi);
+                            let data = buf.data();
+                            let mut scn = Scanner::new(data, lo, hi);
+                            while let Some((line, masks)) = scn.next() {
+                                let mut f = [&b""[..]; 2];
+                                if !split_scanned(line, masks, &mut f) || f[0].is_empty() || f[1].is_empty() {
+                                    continue;
+                                }
+                                let a = PKey::new(f[0], laid, &mut lside);
+                                let b = PKey::new(f[1], laid, &mut lside);
+                                let (pa, pb) = (part(a.hash_in(&lside)), part(b.hash_in(&lside)));
+                                lout.push(pb, LinkRaw { a: b, b: a });
+                                lout.push(pa, LinkRaw { a, b });
+                            }
                         } else {
-                            let r = dedup_clicks(sides, cl_raw, i - P, &mut sc);
-                            unsafe { *clp.p().add(i - P) = Some(r) };
+                            break;
                         }
+                    }
+                    Phase2Out { clicks: cout.finish(), links: lout.finish(), cside, lside }
+                }));
+            }
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
+    let mut cl_raw: Vec<Vec<HugeVec<ClRaw>>> = Vec::with_capacity(nthreads);
+    let mut links: Vec<Vec<HugeVec<LinkRaw>>> = Vec::with_capacity(nthreads);
+    for (t, o) in p2.into_iter().enumerate() {
+        cl_raw.push(o.clicks);
+        links.push(o.links);
+        sides_v[nthreads + t] = o.cside;
+        sides_v[2 * nthreads + t] = o.lside;
+    }
+    let sides: &Sides = &sides_v[..];
+    drop(inputs);
+    log(&t0, "event dedup + clicks/links parse done");
+    // click dedup
+    let next = AtomicUsize::new(0);
+    let mut clv: Vec<Option<Vec<HugeVec<ClValid>>>> = (0..P).map(|_| None).collect();
+    {
+        let clp = Shared(clv.as_mut_ptr());
+        std::thread::scope(|s| {
+            for t in 0..nthreads {
+                let next = &next;
+                let cl_raw = &cl_raw;
+                s.spawn(move || {
+                    pin_thread(t);
+                    let mut sc = Scratch::default();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= P {
+                            break;
+                        }
+                        let r = dedup_clicks(sides, cl_raw, i, &mut sc);
+                        unsafe { *clp.p().add(i) = Some(r) };
                     }
                 });
             }

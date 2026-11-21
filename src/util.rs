@@ -232,18 +232,33 @@ fn map_bytes(bytes: usize) -> *mut u8 {
         return p;
     }
     unsafe {
-        // MAP_POPULATE: the kernel maps and zeroes all pages in one go, instead of one trap per page.
-        let p = libc::mmap(
+        // Large mappings are 2 MB-aligned so transparent huge pages can cover the whole range.
+        let big = bytes >= HUGE_MIN;
+        let ask = if big { bytes + HUGE } else { bytes };
+        let raw = libc::mmap(
             std::ptr::null_mut(),
-            bytes,
+            ask,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | populate(),
             -1,
             0,
         );
-        assert!(p != libc::MAP_FAILED, "mmap failed for {} bytes", bytes);
+        assert!(raw != libc::MAP_FAILED, "mmap failed for {} bytes", bytes);
+        let mut p = raw;
+        if big {
+            let addr = raw as usize;
+            let aligned = (addr + HUGE - 1) & !(HUGE - 1);
+            if aligned > addr {
+                libc::munmap(raw, aligned - addr);
+            }
+            let tail = addr + ask - (aligned + bytes);
+            if tail > 0 {
+                libc::munmap((aligned + bytes) as *mut libc::c_void, tail);
+            }
+            p = aligned as *mut libc::c_void;
+        }
         #[cfg(target_os = "linux")]
-        if bytes >= HUGE_MIN {
+        if big {
             libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
             // MADV_POPULATE_WRITE (Linux 5.14+): fault the whole range in one call, as huge pages where
             // possible, instead of one trap per 4 KB page. Ignored on older kernels. Opt out with NO_POPULATE.
@@ -362,6 +377,37 @@ impl<T> std::ops::DerefMut for HugeVec<T> {
 impl<T> Drop for HugeVec<T> {
     fn drop(&mut self) {
         pool_put(self.ptr as *mut u8, self.bytes);
+    }
+}
+
+/// Pin the calling thread to the t-th CPU of its allowed set (Linux). Best effort; PIN=0 disables.
+pub fn pin_thread(t: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if std::env::var_os("NO_PIN").is_some() {
+            return;
+        }
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return;
+        }
+        let mut allowed = Vec::new();
+        for c in 0..libc::CPU_SETSIZE as usize {
+            if libc::CPU_ISSET(c, &set) {
+                allowed.push(c);
+            }
+        }
+        if allowed.len() < 2 {
+            return;
+        }
+        let cpu = allowed[t % allowed.len()];
+        let mut one: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut one);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = t;
     }
 }
 

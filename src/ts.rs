@@ -131,6 +131,27 @@ pub fn civil19_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
     Some(days * DAY + hh * HOUR + mi * MINUTE + ss * SECOND)
 }
 
+/// F1 for `ingest_ts`, which the rules guarantee is valid: date via the (validated) cache, time digits
+/// parsed without re-checking separators. Falls back to the strict parser on any cache miss.
+#[inline(always)]
+pub fn parse_ingest(s: &[u8], cache: &mut DateCache) -> Option<i64> {
+    if s.len() != 20 {
+        return parse_f1_cached(s, cache);
+    }
+    let w0 = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+    let d2 = u16::from_le_bytes([s[8], s[9]]);
+    let idx = (((s[8] & 0xF) as usize) * 10 + ((s[9] & 0xF) as usize)) & 31;
+    let e = cache[idx];
+    if !(e.valid && e.key == w0 && e.day2 == d2) || s[19] != b'Z' {
+        return parse_f1_cached(s, cache);
+    }
+    let b = |i: usize| -> i64 { (s[i] & 0xF) as i64 };
+    let hh = b(11) * 10 + b(12);
+    let mi = b(14) * 10 + b(15);
+    let ss = b(17) * 10 + b(18);
+    Some(e.days as i64 * DAY + hh * HOUR + mi * MINUTE + ss * SECOND)
+}
+
 /// Strict F1 with a date cache.
 #[inline(always)]
 pub fn parse_f1_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
@@ -338,6 +359,11 @@ mod tests {
             }
             assert_eq!(parse_ts_cached(&s, &mut cache), parse_ts(&s), "{:?}", std::str::from_utf8(&s));
             assert_eq!(parse_f1_cached(&s, &mut cache), parse_f1(&s), "{:?}", std::str::from_utf8(&s));
+            // the ingest fast path is exact on every valid F1 stamp (and agrees on all rejected ones we generate here
+            // except those that differ only inside the time digits, which the rules say never occur)
+            if parse_f1(&s).is_some() {
+                assert_eq!(parse_ingest(&s, &mut cache), parse_f1(&s), "{:?}", std::str::from_utf8(&s));
+            }
         }
     }
     #[test]

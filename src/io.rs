@@ -5,7 +5,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-pub const UNIT: usize = 2 << 20;
+pub const UNIT: usize = 512 << 10;
 
 /// Work-unit size in bytes; UNIT_KB overrides for experiments (a unit that fits L2 keeps the parse reading from L2).
 pub fn unit_size() -> usize {
