@@ -321,11 +321,48 @@ impl Side {
 }
 pub type Sides = [Side];
 
+/// Base-37 value of 8 chars (s[0] most significant) with three independent SWAR steps. None if any char is invalid.
+#[inline(always)]
+fn pack8(s: &[u8]) -> Option<u64> {
+    let t = (CHAR_VAL[s[0] as usize] as u64)
+        | (CHAR_VAL[s[1] as usize] as u64) << 8
+        | (CHAR_VAL[s[2] as usize] as u64) << 16
+        | (CHAR_VAL[s[3] as usize] as u64) << 24
+        | (CHAR_VAL[s[4] as usize] as u64) << 32
+        | (CHAR_VAL[s[5] as usize] as u64) << 40
+        | (CHAR_VAL[s[6] as usize] as u64) << 48
+        | (CHAR_VAL[s[7] as usize] as u64) << 56;
+    // any zero byte => invalid char
+    if (t.wrapping_sub(0x0101_0101_0101_0101) & !t & 0x8080_8080_8080_8080) != 0 {
+        return None;
+    }
+    let e = t & 0x00FF_00FF_00FF_00FF; // t0 t2 t4 t6 (more significant of each pair)
+    let o = (t >> 8) & 0x00FF_00FF_00FF_00FF; // t1 t3 t5 t7
+    let pair = e * 37 + o; // 16-bit lanes, max 1368
+    let pe = pair & 0x0000_FFFF_0000_FFFF;
+    let po = (pair >> 16) & 0x0000_FFFF_0000_FFFF;
+    let quad = pe * 1369 + po; // 32-bit lanes, max 1_874_160
+    Some((quad & 0xFFFF_FFFF) * 1_874_161 + (quad >> 32))
+}
+
+const POW37_8: u64 = 3_512_479_453_921; // 37^8
+
 impl PKey {
     #[inline(always)]
     pub fn new(s: &[u8], aid: usize, side: &mut Side) -> PKey {
         let n = s.len();
-        if n >= 1 && n <= 12 {
+        if n == 9 {
+            let t0 = CHAR_VAL[s[0] as usize] as u64;
+            if t0 != 0 {
+                if let Some(v) = pack8(&s[1..9]) {
+                    return PKey(t0 * POW37_8 + v);
+                }
+            }
+        } else if n == 8 {
+            if let Some(v) = pack8(s) {
+                return PKey(v);
+            }
+        } else if n >= 1 && n <= 12 {
             let mut v: u64 = 0;
             let mut bad = 0u8;
             for &c in s {
@@ -465,6 +502,34 @@ mod pkey_tests {
         assert_eq!(k0.hash(&two), k1.hash(&two));
         assert!(k0.same(&k1, &two));
         assert_eq!(k0.hash_in(&two[0]), k0.hash(&two));
+        // SWAR fast paths agree with the generic encoding
+        fn generic(s: &[u8]) -> u64 {
+            let mut v = 0u64;
+            for &c in s {
+                v = v * 37 + CHAR_VAL[c as usize] as u64;
+            }
+            v
+        }
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        for _ in 0..100000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = 8 + (x & 1) as usize;
+            let mut buf = [0u8; 9];
+            for i in 0..n {
+                let r = (x >> (5 * i)) % 40;
+                buf[i] = if r < 36 { DIGITS[r as usize] } else { b"A_ -"[(r - 36) as usize] };
+            }
+            let sl = &buf[..n];
+            let valid = sl.iter().all(|&c| CHAR_VAL[c as usize] != 0);
+            let mut sd = Side::new();
+            let k = PKey::new(sl, 0, &mut sd);
+            assert_eq!(k.is_packed(), valid, "{:?}", std::str::from_utf8(sl));
+            if valid {
+                assert_eq!(k.0, generic(sl), "{:?}", std::str::from_utf8(sl));
+            }
+        }
         assert!(PKey::new(b"e42huhoug", 0, &mut Side::new()).is_packed());
         assert!(!PKey::new(b"user_id_b", 0, &mut Side::new()).is_packed());
         assert!(!PKey::new(b"", 0, &mut Side::new()).is_packed());
