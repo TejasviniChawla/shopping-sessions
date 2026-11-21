@@ -160,3 +160,10 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   WIN 0.85/0.86 vs 0.91/0.93 wall; in-process 0.74 vs 0.80 (parse .355/.37, dedup .19/.24, persons .155/.165).
   7709e08 direct-index Lookup for p<n>/c_<n>; 6b789aa precomputed click lex key for the click sort. Ten seeds MATCH (8/10 in).
   Output at 10M: 12 MB (user_id dict+snappy 1.4 MB/part of 3 MB). 30M scaling run dispatched.
+- 2026-11-21 ~04:30 ET: main = 6d5c18e (ten seeds MATCH). 30M on Zen3: 2.71 s wall / 2.50 in-process, linear, no OOM.
+  882ead9: dedup = two passes over raw records (probe table of (key, idx) 16 B slots; no copy/sub-buckets), ~20k rec/partition
+  up to 1024 partitions; TIMING=1 sub-timers. Mac thread-seconds (4 thr, 10M): event pread 1.5-1.7 (!! macOS page cache),
+  scan+parse 1.1-1.2; dedup probe 0.09, emit 0.27-0.30 (of which link lookups ~0.13: NOLINK experiment); person ids 0.08,
+  counting sort 0.02, sorts 0.12, walk 0.16-0.18. Events are in random time order (no pre-sorted shortcut).
+  CI timing run 44880051547 (TIMING, USE_MMAP, LOG_P=8 sets). Deferred: resolve person once per distinct user (~2% at 10M,
+  more at 60M); 12 B link slots (keys+u32 names) to keep the map in L3.
