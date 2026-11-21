@@ -3,6 +3,7 @@
 mod csv;
 mod io;
 mod out;
+mod pq;
 mod ts;
 mod util;
 
@@ -1356,17 +1357,12 @@ fn run() {
                     let mut buf = [0u8; 12];
                     for r in &w.rows {
                         let name = person_name[r.person as usize].bytes(sides, &mut buf);
-                        uc.user_id.append_value(unsafe { std::str::from_utf8_unchecked(name) });
+                        uc.push_user(name);
                         uc.day.push(r.day);
                         uc.sessions.push(r.sessions as i64);
                         uc.events.push(r.events as i64);
                         uc.revenue.push(r.revenue);
-                        if r.top_cat == u16::MAX {
-                            uc.top_category.append_null();
-                        } else {
-                            uc.top_category
-                                .append_value(unsafe { std::str::from_utf8_unchecked(&ctx.cat_names[r.top_cat as usize]) });
-                        }
+                        uc.push_cat(if r.top_cat == u16::MAX { None } else { Some(&ctx.cat_names[r.top_cat as usize][..]) });
                     }
                     out::write_user_daily(&user_dir.join(format!("part-{}.parquet", t)), uc).expect("write user_daily");
                 }
@@ -1395,8 +1391,7 @@ fn run() {
             if c[0] == 0 && c[3] == 0 {
                 continue;
             }
-            cc.campaign_id.append_value(unsafe { std::str::from_utf8_unchecked(&ctx.camp_names[ci]) });
-            cc.channel.append_value(unsafe { std::str::from_utf8_unchecked(&ctx.channels[ci]) });
+            cc.push_ids(&ctx.camp_names[ci], &ctx.channels[ci]);
             cc.day.push((day0 + d as i64) as i32);
             cc.sessions.push(c[0]);
             cc.purchasing_sessions.push(c[1]);

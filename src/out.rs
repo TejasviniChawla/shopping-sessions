@@ -1,79 +1,76 @@
-//! Parquet output of the two tables.
+//! Parquet output of the two tables via the minimal PLAIN writer in `pq.rs`.
 
-use arrow_array::builder::StringBuilder;
-use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use std::fs::File;
+use crate::pq::{self, Col};
 use std::path::Path;
-use std::sync::Arc;
 
-fn props() -> WriterProperties {
-    WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_max_row_group_row_count(Some(1 << 20))
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
-        .build()
-}
-
+/// Columnar buffers for user_daily rows; strings are stored as (offsets, bytes).
 pub struct UserDailyCols {
-    pub user_id: StringBuilder,
+    pub uid_offs: Vec<u32>,
+    pub uid_bytes: Vec<u8>,
     pub day: Vec<i32>,
     pub sessions: Vec<i64>,
     pub events: Vec<i64>,
     pub revenue: Vec<i64>,
-    pub top_category: StringBuilder,
+    pub cat_offs: Vec<u32>,
+    pub cat_bytes: Vec<u8>,
+    pub cat_valid: Vec<bool>,
 }
 
 impl UserDailyCols {
     pub fn new(n: usize) -> Self {
+        let mut uid_offs = Vec::with_capacity(n + 1);
+        uid_offs.push(0);
+        let mut cat_offs = Vec::with_capacity(n + 1);
+        cat_offs.push(0);
         UserDailyCols {
-            user_id: StringBuilder::with_capacity(n, n * 10),
+            uid_offs,
+            uid_bytes: Vec::with_capacity(n * 10),
             day: Vec::with_capacity(n),
             sessions: Vec::with_capacity(n),
             events: Vec::with_capacity(n),
             revenue: Vec::with_capacity(n),
-            top_category: StringBuilder::with_capacity(n, n * 4),
+            cat_offs,
+            cat_bytes: Vec::with_capacity(n * 2),
+            cat_valid: Vec::with_capacity(n),
         }
+    }
+    #[inline(always)]
+    pub fn push_user(&mut self, b: &[u8]) {
+        self.uid_bytes.extend_from_slice(b);
+        self.uid_offs.push(self.uid_bytes.len() as u32);
+    }
+    #[inline(always)]
+    pub fn push_cat(&mut self, b: Option<&[u8]>) {
+        if let Some(b) = b {
+            self.cat_bytes.extend_from_slice(b);
+            self.cat_valid.push(true);
+        } else {
+            self.cat_valid.push(false);
+        }
+        self.cat_offs.push(self.cat_bytes.len() as u32);
+    }
+    pub fn len(&self) -> usize {
+        self.day.len()
     }
 }
 
-pub fn write_user_daily(path: &Path, mut c: UserDailyCols) -> std::io::Result<()> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
-    let cols: Vec<ArrayRef> = vec![
-        Arc::new(c.user_id.finish()),
-        Arc::new(Date32Array::from(c.day)),
-        Arc::new(Int64Array::from(c.sessions)),
-        Arc::new(Int64Array::from(c.events)),
-        Arc::new(Int64Array::from(c.revenue)),
-        Arc::new(c.top_category.finish()),
+pub fn write_user_daily(path: &Path, c: UserDailyCols) -> std::io::Result<()> {
+    let cols = [
+        Col::Str("user_id", &c.uid_offs, &c.uid_bytes, None),
+        Col::Date("day", &c.day),
+        Col::I64("sessions", &c.sessions),
+        Col::I64("events", &c.events),
+        Col::I64("revenue_cents", &c.revenue),
+        Col::Str("top_category", &c.cat_offs, &c.cat_bytes, Some(&c.cat_valid)),
     ];
-    let batch = RecordBatch::try_new(schema.clone(), cols).expect("batch");
-    let file = File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_max_row_group_row_count(Some(1 << 20))
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
-        .set_column_dictionary_enabled("user_id".into(), false)
-        .build();
-    let mut w = ArrowWriter::try_new(file, schema, Some(props)).expect("writer");
-    w.write(&batch).expect("write");
-    w.close().expect("close");
-    Ok(())
+    pq::write(path, &cols, c.len())
 }
 
 pub struct CampaignDailyCols {
-    pub campaign_id: StringBuilder,
-    pub channel: StringBuilder,
+    pub cid_offs: Vec<u32>,
+    pub cid_bytes: Vec<u8>,
+    pub ch_offs: Vec<u32>,
+    pub ch_bytes: Vec<u8>,
     pub day: Vec<i32>,
     pub sessions: Vec<i64>,
     pub purchasing_sessions: Vec<i64>,
@@ -84,8 +81,10 @@ pub struct CampaignDailyCols {
 impl CampaignDailyCols {
     pub fn new(n: usize) -> Self {
         CampaignDailyCols {
-            campaign_id: StringBuilder::with_capacity(n, n * 6),
-            channel: StringBuilder::with_capacity(n, n * 7),
+            cid_offs: vec![0],
+            cid_bytes: Vec::with_capacity(n * 6),
+            ch_offs: vec![0],
+            ch_bytes: Vec::with_capacity(n * 7),
             day: Vec::with_capacity(n),
             sessions: Vec::with_capacity(n),
             purchasing_sessions: Vec::with_capacity(n),
@@ -93,32 +92,25 @@ impl CampaignDailyCols {
             assisted_sessions: Vec::with_capacity(n),
         }
     }
+    #[inline(always)]
+    pub fn push_ids(&mut self, cid: &[u8], ch: &[u8]) {
+        self.cid_bytes.extend_from_slice(cid);
+        self.cid_offs.push(self.cid_bytes.len() as u32);
+        self.ch_bytes.extend_from_slice(ch);
+        self.ch_offs.push(self.ch_bytes.len() as u32);
+    }
 }
 
-pub fn write_campaign_daily(dir: &Path, mut c: CampaignDailyCols) -> std::io::Result<()> {
+pub fn write_campaign_daily(dir: &Path, c: CampaignDailyCols) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("campaign_id", DataType::Utf8, false),
-        Field::new("channel", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("purchasing_sessions", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("assisted_sessions", DataType::Int64, false),
-    ]));
-    let cols: Vec<ArrayRef> = vec![
-        Arc::new(c.campaign_id.finish()),
-        Arc::new(c.channel.finish()),
-        Arc::new(Date32Array::from(c.day)),
-        Arc::new(Int64Array::from(c.sessions)),
-        Arc::new(Int64Array::from(c.purchasing_sessions)),
-        Arc::new(Int64Array::from(c.revenue)),
-        Arc::new(Int64Array::from(c.assisted_sessions)),
+    let cols = [
+        Col::Str("campaign_id", &c.cid_offs, &c.cid_bytes, None),
+        Col::Str("channel", &c.ch_offs, &c.ch_bytes, None),
+        Col::Date("day", &c.day),
+        Col::I64("sessions", &c.sessions),
+        Col::I64("purchasing_sessions", &c.purchasing_sessions),
+        Col::I64("revenue_cents", &c.revenue),
+        Col::I64("assisted_sessions", &c.assisted_sessions),
     ];
-    let batch = RecordBatch::try_new(schema.clone(), cols).expect("batch");
-    let file = File::create(dir.join("part-0.parquet"))?;
-    let mut w = ArrowWriter::try_new(file, schema, Some(props())).expect("writer");
-    w.write(&batch).expect("write");
-    w.close().expect("close");
-    Ok(())
+    pq::write(&dir.join("part-0.parquet"), &cols, c.day.len())
 }

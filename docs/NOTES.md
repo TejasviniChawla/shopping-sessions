@@ -104,3 +104,6 @@ Correctness first: 36 fixtures + exact match on dev-answer (1M events, seed 1).
   MADV_HUGEPAGE for >=2MB HugeVecs.
 - 2026-11-22 ~01:15 ET: pool build 2cf679a A/B +5% vs a805d87 (recommended; 10 seeds MATCH). f747a2d (pooled intern slots,
   u64 event_type compare) +2% vs 2cf679a on Sapphire Rapids. Next: UNIT_KB experiment (L2-resident parse buffers).
+- 2026-11-22 ~02:00 ET: UNIT_KB experiment (same runner, native): 512 KB units halve sys time (1.02 -> 0.50 s) and cut total ~10%.
+  Batch 574a577 (512 KB units, 2 MB-aligned maps, pinning, dedup||clicks/links overlap, fast ingest) A/B: 0.71-0.74 vs 0.73-0.82 (f747a2d).
+  Replacing arrow/parquet crates with a minimal PLAIN parquet writer (src/pq.rs), validated with polars + pyarrow.
