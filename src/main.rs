@@ -275,20 +275,15 @@ fn parse_click_line(ctx: &Ctx, side: &mut Side, line: &[u8], masks: Option<(u128
 struct LinkMap {
     slots: Vec<(u64, u64)>, // (key, name); key 0 = empty
     mask: usize,
-    filter: Vec<u64>,
-    fmask: usize,
 }
 
 impl LinkMap {
     fn new(n: usize) -> Self {
         let cap = (n * 2).max(1024).next_power_of_two();
-        let fbits = (n * 16).max(1 << 16).next_power_of_two();
-        LinkMap { slots: vec![(0, 0); cap], mask: cap - 1, filter: vec![0u64; fbits / 64], fmask: fbits - 1 }
+        LinkMap { slots: vec![(0, 0); cap], mask: cap - 1 }
     }
     fn insert(&mut self, key: u64, name: u64) {
         let h = PKey(key).hash();
-        let fb = (h as usize) & self.fmask;
-        self.filter[fb >> 6] |= 1 << (fb & 63);
         let mut s = ((h >> 20) as usize) & self.mask;
         loop {
             if self.slots[s].0 == 0 || self.slots[s].0 == key {
@@ -302,13 +297,9 @@ impl LinkMap {
     fn prefetch(&self, h: u64) {
         prefetch(unsafe { self.slots.as_ptr().add(((h >> 20) as usize) & self.mask) });
     }
-    /// Name key of a linked ID, or None when the ID is not in any link (cheap filter miss first).
+    /// Name key of a linked ID, or None when the ID is not in any link. Callers prefetch the slot.
     #[inline(always)]
     fn get(&self, key: u64, h: u64) -> Option<u64> {
-        let fb = (h as usize) & self.fmask;
-        if (self.filter[fb >> 6] >> (fb & 63)) & 1 == 0 {
-            return None;
-        }
         let mut s = ((h >> 20) as usize) & self.mask;
         loop {
             let (k, n) = self.slots[s];

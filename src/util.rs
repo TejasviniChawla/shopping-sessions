@@ -130,20 +130,38 @@ static CHAR_VAL: [u8; 256] = {
 };
 const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
-/// Base-37 value of 8 chars (s[0] most significant) with three independent SWAR steps. None if any char is invalid.
+/// Base-37 digit values (1..=36) of 8 bytes, one per byte of the result, or None if any byte is not [0-9a-z].
+/// Pure SWAR: digits 0x30..0x39 map to 1..10, letters 0x61..0x7a to 11..36; the result is verified by
+/// reconstructing the original bytes and bounding each value.
 #[inline(always)]
-fn pack8(s: &[u8]) -> Option<u64> {
-    let t = (CHAR_VAL[s[0] as usize] as u64)
-        | (CHAR_VAL[s[1] as usize] as u64) << 8
-        | (CHAR_VAL[s[2] as usize] as u64) << 16
-        | (CHAR_VAL[s[3] as usize] as u64) << 24
-        | (CHAR_VAL[s[4] as usize] as u64) << 32
-        | (CHAR_VAL[s[5] as usize] as u64) << 40
-        | (CHAR_VAL[s[6] as usize] as u64) << 48
-        | (CHAR_VAL[s[7] as usize] as u64) << 56;
-    if (t.wrapping_sub(0x0101_0101_0101_0101) & !t & 0x8080_8080_8080_8080) != 0 {
+fn digits8(w: u64) -> Option<u64> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    let alpha = (w >> 6) & LO; // 1 for letters (bit 6 set), 0 for digits
+    let t = (w & (LO * 0x1F)).wrapping_add(alpha * 25).wrapping_sub(LO * 0x0F);
+    // reconstruct: digit -> t - 1 + 0x30 = t + 0x2F ; letter -> t - 11 + 0x61 = t + 0x56 = t + 0x2F + 0x27
+    let back = t.wrapping_add(LO * 0x2F).wrapping_add(alpha * 0x27);
+    // any borrow in t leaves a value byte >= 0xF1 (and could be cancelled by a carry in back), so reject
+    // those first; afterwards every byte of t is < 0x80 and the bound test below cannot carry.
+    if back != w || (t & (LO * 0x80)) != 0 {
         return None;
     }
+    // bound: digit value <= 10, letter value <= 36
+    let limit = (LO * 0x0A) + alpha * 0x1A;
+    let over = (t.wrapping_add(LO * 0x7F).wrapping_sub(limit)) & (LO * 0x80);
+    // lower bound: digit value >= 1, letter value >= 11, i.e. (t - 10*alpha) has no zero byte
+    let tl = t.wrapping_sub(alpha * 10);
+    let zero = tl.wrapping_sub(LO) & (LO * 0x80);
+    if (over | zero) != 0 {
+        return None;
+    }
+    Some(t)
+}
+
+/// Base-37 value of 8 chars (s[0] most significant). None if any char is invalid.
+#[inline(always)]
+fn pack8(s: &[u8]) -> Option<u64> {
+    let w = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+    let t = digits8(w)?;
     let e = t & 0x00FF_00FF_00FF_00FF;
     let o = (t >> 8) & 0x00FF_00FF_00FF_00FF;
     let pair = e * 37 + o;
@@ -151,6 +169,20 @@ fn pack8(s: &[u8]) -> Option<u64> {
     let po = (pair >> 16) & 0x0000_FFFF_0000_FFFF;
     let quad = pe * 1369 + po;
     Some((quad & 0xFFFF_FFFF) * 1_874_161 + (quad >> 32))
+}
+
+/// Table-driven reference of `pack8` (tests only).
+#[cfg(test)]
+fn pack8_ref(s: &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for &c in &s[..8] {
+        let t = CHAR_VAL[c as usize];
+        if t == 0 {
+            return None;
+        }
+        v = v * 37 + t as u64;
+    }
+    Some(v)
 }
 
 const POW37_8: u64 = 3_512_479_453_921; // 37^8
@@ -199,11 +231,8 @@ impl PKey {
     }
     #[inline(always)]
     pub fn hash(&self) -> u64 {
-        let mut h = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 32;
-        h = h.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        h ^= h >> 29;
-        h
+        let h = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^ (h >> 29)
     }
     /// The ID's bytes, written into `buf`.
     #[inline]
@@ -273,6 +302,27 @@ mod pkey_tests {
             }
             if a.is_packed() {
                 assert_eq!(PKey::from_lex_key(a.lex_key()), *a);
+            }
+        }
+        // SWAR packer vs table reference: every byte value in every position, plus pairs of odd bytes
+        let base = *b"a1b2c3d4";
+        for i in 0..8 {
+            for v in 0..=255u8 {
+                let mut b = base;
+                b[i] = v;
+                assert_eq!(pack8(&b), pack8_ref(&b), "pos {} byte {:#x}", i, v);
+            }
+        }
+        for i in 0..8 {
+            for j in 0..8 {
+                for &v in &[0u8, 0x2F, 0x3A, 0x40, 0x41, 0x5A, 0x60, 0x7B, 0x7F, 0x80, 0xFF, b'0', b'9', b'a', b'z'] {
+                    for &u in &[0u8, 0x2F, 0x3A, 0x60, 0x7B, 0xFF, b'5', b'm'] {
+                        let mut b = base;
+                        b[i] = v;
+                        b[j] = u;
+                        assert_eq!(pack8(&b), pack8_ref(&b));
+                    }
+                }
             }
         }
         // same fallback string from "another thread" gets the same key
